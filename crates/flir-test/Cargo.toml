@@ -1,0 +1,13 @@
+[package]
+name = "flir-test"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+infinity-flir.workspace = true
+eframe = { version = "0.36", features = ["persistence"] }
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+] }
+rfd = "0.15"

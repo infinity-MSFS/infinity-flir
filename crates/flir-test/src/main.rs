@@ -1,15 +1,16 @@
-mod capture;
-mod flir;
-mod horizon;
-
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use eframe::egui::{self, Color32, ComboBox, Rect, Slider, TextureHandle, TextureOptions, pos2};
-use flir::{FlirProcessor, FlirSettings, Palette, Polarity, SourceFrame, downsample_with};
+use eframe::egui::{
+    self, Color32, ColorImage, ComboBox, Rect, Slider, TextureHandle, TextureOptions, pos2,
+};
+use infinity_flir::capture::{self, Feed};
+use infinity_flir::{
+    CHUNK_CHARS, Crop, Encoding, FlirProcessor, FlirSettings, Palette, Polarity, SourceFrame,
+    downsample_with,
+};
 
 const SETTINGS_KEY: &str = "flir_settings";
+const SMOOTH_KEY: &str = "smooth_display";
 
 fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().collect();
@@ -37,14 +38,14 @@ fn arg(args: &[String], name: &str) -> Option<String> {
         .and_then(|i| args.get(i + 1).cloned())
 }
 
-fn load_still(path: &str, sensor_w: usize) -> Result<SourceFrame, String> {
+fn load_still(path: &str, s: &FlirSettings) -> Result<SourceFrame, String> {
     let img = image::open(path).map_err(|e| e.to_string())?.to_rgb32f();
-    let (w, h) = (img.width() as usize, img.height() as usize);
+    let (x0, y0, w, h) = s.crop.pixels(img.width() as usize, img.height() as usize);
     Ok(downsample_with(
         w,
         h,
-        sensor_w,
-        |x, y| img.get_pixel(x as u32, y as u32).0,
+        s.sensor_width,
+        |x, y| img.get_pixel((x0 + x) as u32, (y0 + y) as u32).0,
         |c| c,
     ))
 }
@@ -81,37 +82,41 @@ fn headless(input: &str, output: &str) {
     if let Some(v) = num("--alt") {
         hz.altitude_ft = v;
     }
-    let src = load_still(input, s.sensor_width).expect("load image");
+    let src = load_still(input, &s).expect("load image");
     let mut p = FlirProcessor::default();
     let mut img = p.process(&src, &s);
     for _ in 0..30 {
         img = p.process(&src, &s);
     }
-    let bytes: Vec<u8> = img
-        .pixels
-        .iter()
-        .flat_map(|c| [c.r(), c.g(), c.b()])
-        .collect();
     image::save_buffer(
         output,
-        &bytes,
-        img.size[0] as u32,
-        img.size[1] as u32,
-        image::ColorType::Rgb8,
+        img.rgba.as_flattened(),
+        img.w as u32,
+        img.h as u32,
+        image::ColorType::Rgba8,
     )
     .expect("save");
+    if let Some(path) = arg(&std::env::args().collect::<Vec<_>>(), "--packet") {
+        let encoding = if std::env::args().any(|a| a == "--rgba") {
+            Encoding::Rgba8
+        } else {
+            Encoding::Gray8
+        };
+        std::fs::write(path, img.packet(encoding).to_bytes()).expect("write packet");
+    }
 }
 
 enum Source {
     None,
-    Live(capture::CaptureHandle),
+    Live(Feed),
     Still { path: String, frame: SourceFrame },
 }
 
 struct App {
     settings: FlirSettings,
+    smooth_display: bool,
+    encoding: Encoding,
     proc: FlirProcessor,
-    shared: Arc<capture::Shared>,
     targets: Vec<(String, capture::Target)>,
     selected: usize,
     source: Source,
@@ -119,6 +124,8 @@ struct App {
     tex: Option<TextureHandle>,
     status: String,
     process_ms: f32,
+    packet_stats: (usize, usize),
+    geometry: (usize, Crop),
     fps_window: (Instant, u64, u32),
     capture_fps: f32,
     display_fps: f32,
@@ -130,12 +137,17 @@ impl App {
             .storage
             .and_then(|s| eframe::get_value(s, SETTINGS_KEY))
             .unwrap_or_default();
-        let shared = capture::Shared::new(settings.sensor_width);
+        let smooth_display = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, SMOOTH_KEY))
+            .unwrap_or(true);
         let targets = capture::list_targets();
         Self {
+            geometry: (settings.sensor_width, settings.crop),
             settings,
+            smooth_display,
+            encoding: Encoding::Gray8,
             proc: FlirProcessor::default(),
-            shared,
             targets,
             selected: 0,
             source: Source::None,
@@ -147,6 +159,7 @@ impl App {
                 "Live capture is Windows-only; load a still image.".into()
             },
             process_ms: 0.0,
+            packet_stats: (0, 0),
             fps_window: (Instant::now(), 0, 0),
             capture_fps: 0.0,
             display_fps: 0.0,
@@ -160,12 +173,17 @@ impl App {
             return;
         };
         self.proc.reset();
-        let hdr = self.settings.capture_hdr;
-        match capture::start(target, self.shared.clone(), ctx.clone(), hdr) {
-            Ok(h) => {
-                let fmt = if hdr { "16-bit float" } else { "8-bit" };
+        match Feed::start(target, &self.settings) {
+            Ok(feed) => {
+                let ctx = ctx.clone();
+                feed.on_frame(move || ctx.request_repaint());
+                let fmt = if self.settings.capture_hdr {
+                    "16-bit float"
+                } else {
+                    "8-bit"
+                };
                 self.status = format!("Capturing {name} ({fmt})");
-                self.source = Source::Live(h);
+                self.source = Source::Live(feed);
             }
             Err(e) => self.status = e,
         }
@@ -179,7 +197,7 @@ impl App {
             return;
         };
         let path = path.to_string_lossy().to_string();
-        match load_still(&path, self.settings.sensor_width) {
+        match load_still(&path, &self.settings) {
             Ok(frame) => {
                 self.proc.reset();
                 self.status = format!("Still: {path}");
@@ -241,6 +259,13 @@ impl App {
                 f.w, f.h, self.process_ms, self.capture_fps, self.display_fps
             ));
         }
+        ui.horizontal(|ui| {
+            ui.label("Packet");
+            ui.selectable_value(&mut self.encoding, Encoding::Gray8, "Gray8");
+            ui.selectable_value(&mut self.encoding, Encoding::Rgba8, "Rgba8");
+            let (bytes, chunks) = self.packet_stats;
+            ui.small(format!("{:.1} KB · {chunks} chunks", bytes as f32 / 1024.0));
+        });
 
         ui.separator();
         let s = &mut self.settings;
@@ -281,7 +306,20 @@ impl App {
                         .text("width px"),
                 );
                 ui.add(Slider::new(&mut s.persistence, 0.0..=0.95).text("persistence"));
-                ui.checkbox(&mut s.smooth_display, "Smooth display filtering");
+                ui.checkbox(&mut self.smooth_display, "Smooth display filtering");
+            });
+
+        egui::CollapsingHeader::new("Crop")
+            .default_open(true)
+            .show(ui, |ui| {
+                let c = &mut s.crop;
+                ui.add(Slider::new(&mut c.x, 0.0..=0.95).text("left"));
+                ui.add(Slider::new(&mut c.y, 0.0..=0.95).text("top"));
+                ui.add(Slider::new(&mut c.w, 0.05..=1.0).text("width"));
+                ui.add(Slider::new(&mut c.h, 0.05..=1.0).text("height"));
+                if ui.button("Reset crop").clicked() {
+                    *c = Crop::default();
+                }
             });
 
         egui::CollapsingHeader::new("Heat proxy")
@@ -391,21 +429,22 @@ impl App {
     }
 
     fn update_frame(&mut self, ctx: &egui::Context) {
-        if self
-            .shared
-            .sensor_w
-            .swap(self.settings.sensor_width, Ordering::Relaxed)
-            != self.settings.sensor_width
-        {
-            if let Source::Still { path, frame } = &mut self.source {
-                if let Ok(f) = load_still(path, self.settings.sensor_width) {
-                    *frame = f;
+        let geometry = (self.settings.sensor_width, self.settings.crop);
+        if geometry != self.geometry {
+            self.geometry = geometry;
+            match &mut self.source {
+                Source::Live(feed) => feed.configure(&self.settings),
+                Source::Still { path, frame } => {
+                    if let Ok(f) = load_still(path, &self.settings) {
+                        *frame = f;
+                    }
                 }
+                Source::None => {}
             }
         }
 
         let fresh = match &self.source {
-            Source::Live(_) => self.shared.latest.lock().unwrap().take(),
+            Source::Live(feed) => feed.latest(),
             _ => None,
         };
         if let Some(f) = fresh {
@@ -421,7 +460,10 @@ impl App {
         let img = self.proc.process(src, &self.settings);
         self.process_ms = self.process_ms * 0.9 + t.elapsed().as_secs_f32() * 1000.0 * 0.1;
 
-        let opts = if self.settings.smooth_display {
+        let bytes = img.packet(self.encoding).to_bytes().len();
+        self.packet_stats = (bytes, (bytes.div_ceil(3) * 4).div_ceil(CHUNK_CHARS));
+        let img = ColorImage::from_rgba_unmultiplied([img.w, img.h], img.rgba.as_flattened());
+        let opts = if self.smooth_display {
             TextureOptions::LINEAR
         } else {
             TextureOptions::NEAREST
@@ -439,7 +481,10 @@ impl App {
         *shown += 1;
         let dt = start.elapsed().as_secs_f32();
         if dt >= 1.0 {
-            let frames = self.shared.frames.load(Ordering::Relaxed);
+            let frames = match &self.source {
+                Source::Live(feed) => feed.frames(),
+                _ => *frames0,
+            };
             self.capture_fps = (frames - *frames0) as f32 / dt;
             self.display_fps = *shown as f32 / dt;
             *start = Instant::now();
@@ -484,5 +529,6 @@ impl eframe::App for App {
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, SETTINGS_KEY, &self.settings);
+        eframe::set_value(storage, SMOOTH_KEY, &self.smooth_display);
     }
 }

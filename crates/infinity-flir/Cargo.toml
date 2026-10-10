@@ -1,0 +1,18 @@
+[package]
+name = "infinity-flir"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = ["capture"]
+process = ["dep:rayon", "dep:half"]
+capture = ["process", "dep:windows-capture"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+base64 = "0.22"
+rayon = { version = "1", optional = true }
+half = { version = "2", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-capture = { version = "2", optional = true }

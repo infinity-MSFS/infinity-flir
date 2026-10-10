@@ -1,31 +1,90 @@
-use std::sync::atomic::{AtomicU64, AtomicUsize};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
-use crate::flir::SourceFrame;
+use crate::flir::{Crop, FlirSettings, SourceFrame};
 
-pub struct Shared {
-    pub latest: Mutex<Option<SourceFrame>>,
-    pub sensor_w: AtomicUsize,
-    pub frames: AtomicU64,
+type Notify = Box<dyn Fn() + Send + Sync>;
+
+struct Shared {
+    latest: Mutex<Option<SourceFrame>>,
+    ready: Condvar,
+    geometry: Mutex<(usize, Crop)>,
+    frames: AtomicU64,
+    notify: Mutex<Option<Notify>>,
 }
 
 impl Shared {
-    pub fn new(sensor_w: usize) -> Arc<Self> {
-        Arc::new(Self {
+    fn publish(&self, frame: SourceFrame) {
+        *self.latest.lock().unwrap() = Some(frame);
+        self.frames.fetch_add(1, Ordering::Relaxed);
+        self.ready.notify_all();
+        if let Some(n) = &*self.notify.lock().unwrap() {
+            n();
+        }
+    }
+}
+
+pub struct Feed {
+    shared: Arc<Shared>,
+    _handle: imp::CaptureHandle,
+}
+
+impl Feed {
+    pub fn start(target: &Target, s: &FlirSettings) -> Result<Self, String> {
+        let shared = Arc::new(Shared {
             latest: Mutex::new(None),
-            sensor_w: AtomicUsize::new(sensor_w),
+            ready: Condvar::new(),
+            geometry: Mutex::new((s.sensor_width, s.crop)),
             frames: AtomicU64::new(0),
+            notify: Mutex::new(None),
+        });
+        let handle = imp::start(target, shared.clone(), s.capture_hdr)?;
+        Ok(Self {
+            shared,
+            _handle: handle,
         })
     }
+
+    pub fn configure(&self, s: &FlirSettings) {
+        *self.shared.geometry.lock().unwrap() = (s.sensor_width, s.crop);
+    }
+
+    pub fn on_frame(&self, f: impl Fn() + Send + Sync + 'static) {
+        *self.shared.notify.lock().unwrap() = Some(Box::new(f));
+    }
+
+    pub fn latest(&self) -> Option<SourceFrame> {
+        self.shared.latest.lock().unwrap().take()
+    }
+
+    pub fn wait(&self, timeout: Duration) -> Option<SourceFrame> {
+        let guard = self.shared.latest.lock().unwrap();
+        let (mut guard, _) = self
+            .shared
+            .ready
+            .wait_timeout_while(guard, timeout, |f| f.is_none())
+            .unwrap();
+        guard.take()
+    }
+
+    pub fn frames(&self) -> u64 {
+        self.shared.frames.load(Ordering::Relaxed)
+    }
+}
+
+pub fn find_window(title: &str) -> Option<Target> {
+    list_targets()
+        .into_iter()
+        .find(|(name, t)| matches!(t, Target::Window(_)) && name.contains(title))
+        .map(|(_, t)| t)
 }
 
 #[cfg(windows)]
 mod imp {
     use super::Shared;
     use crate::flir::{PixelFormat, downsample_raw};
-    use eframe::egui;
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
     use windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
     use windows_capture::frame::Frame;
     use windows_capture::graphics_capture_api::InternalCaptureControl;
@@ -51,7 +110,7 @@ mod imp {
                 let dev = m.device_name().unwrap_or_default();
                 let (w, h) = (m.width().unwrap_or(0), m.height().unwrap_or(0));
                 out.push((
-                    format!("Monitor {} {dev} ({w}x{h}", i + 1),
+                    format!("Monitor {} {dev} ({w}x{h})", i + 1),
                     Target::Monitor(m),
                 ));
             }
@@ -74,17 +133,16 @@ mod imp {
 
     struct Handler {
         shared: Arc<Shared>,
-        ctx: egui::Context,
         fmt: PixelFormat,
     }
 
     impl GraphicsCaptureApiHandler for Handler {
-        type Flags = (Arc<Shared>, egui::Context, PixelFormat);
+        type Flags = (Arc<Shared>, PixelFormat);
         type Error = BoxErr;
 
         fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
-            let (shared, ctx, fmt) = ctx.flags;
-            Ok(Self { shared, ctx, fmt })
+            let (shared, fmt) = ctx.flags;
+            Ok(Self { shared, fmt })
         }
 
         fn on_frame_arrived(
@@ -92,17 +150,15 @@ mod imp {
             frame: &mut Frame,
             _control: InternalCaptureControl,
         ) -> Result<(), Self::Error> {
-            let out_w = self.shared.sensor_w.load(Ordering::Relaxed);
+            let (out_w, crop) = *self.shared.geometry.lock().unwrap();
             let mut buf = frame.buffer()?;
             let (w, h, pitch) = (
                 buf.width() as usize,
                 buf.height() as usize,
                 buf.row_pitch() as usize,
             );
-            let sf = downsample_raw(buf.as_raw_buffer(), w, h, pitch, self.fmt, out_w);
-            *self.shared.latest.lock().unwrap() = Some(sf);
-            self.shared.frames.fetch_add(1, Ordering::Relaxed);
-            self.ctx.request_repaint();
+            let sf = downsample_raw(buf.as_raw_buffer(), w, h, pitch, self.fmt, out_w, crop);
+            self.shared.publish(sf);
             Ok(())
         }
 
@@ -121,18 +177,13 @@ mod imp {
         }
     }
 
-    pub fn start(
-        target: &Target,
-        shared: Arc<Shared>,
-        ctx: egui::Context,
-        hdr: bool,
-    ) -> Result<CaptureHandle, String> {
+    pub fn start(target: &Target, shared: Arc<Shared>, hdr: bool) -> Result<CaptureHandle, String> {
         let (fmt, color) = if hdr {
             (PixelFormat::Rgba16F, ColorFormat::Rgba16F)
         } else {
             (PixelFormat::Rgba8, ColorFormat::Rgba8)
         };
-        let flags = (shared, ctx, fmt);
+        let flags = (shared, fmt);
         macro_rules! go {
             ($item:expr) => {
                 Handler::start_free_threaded(Settings::new(
@@ -159,11 +210,12 @@ mod imp {
 #[cfg(not(windows))]
 mod imp {
     use super::Shared;
-    use eframe::egui;
     use std::sync::Arc;
 
     #[derive(Clone)]
-    pub enum Target {}
+    pub enum Target {
+        Window(std::convert::Infallible),
+    }
 
     pub struct CaptureHandle;
 
@@ -171,14 +223,9 @@ mod imp {
         Vec::new()
     }
 
-    pub fn start(
-        _: &Target,
-        _: Arc<Shared>,
-        _: egui::Context,
-        _: bool,
-    ) -> Result<CaptureHandle, String> {
+    pub fn start(_: &Target, _: Arc<Shared>, _: bool) -> Result<CaptureHandle, String> {
         Err("screen capture is only available on Windows".into())
     }
 }
 
-pub use imp::{CaptureHandle, Target, list_targets, start};
+pub use imp::{Target, list_targets};

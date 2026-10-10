@@ -1,21 +1,13 @@
-[package]
-name = "infinity-flir"
+[workspace]
+resolver = "3"
+members = ["crates/infinity-flir", "crates/flir-test"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
-eframe = { version = "0.36", features = ["persistence"] }
-serde = { version = "1", features = ["derive"] }
-rayon = "1"
-image = { version = "0.25", default-features = false, features = [
-    "png",
-    "jpeg",
-] }
-rfd = "0.15"
-half = "2"
-
-[target.'cfg(windows)'.dependencies]
-windows-capture = "2"
+[workspace.dependencies]
+infinity-flir = { path = "crates/infinity-flir" }
 
 [profile.dev]
 opt-level = 2

@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 const EARTH_RADIUS_M: f32 = 6_371_000.0;
-const FT_TO_M: f32 = 0.03048;
+const FT_TO_M: f32 = 0.3048;
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(default)]

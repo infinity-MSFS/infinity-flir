@@ -1,13 +1,68 @@
-use eframe::egui::{Color32, ColorImage};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::horizon::{HorizonCache, HorizonSettings};
+use crate::stream::{Encoding, Packet};
 
 pub struct SourceFrame {
     pub w: usize,
     pub h: usize,
     pub rgb: Vec<[f32; 3]>,
+}
+
+pub struct FlirImage {
+    pub w: usize,
+    pub h: usize,
+    pub rgba: Vec<[u8; 4]>,
+}
+
+impl FlirImage {
+    pub fn packet(&self, encoding: Encoding) -> Packet {
+        let data = match encoding {
+            Encoding::Rgba8 => self.rgba.as_flattened().to_vec(),
+            Encoding::Gray8 => self.rgba.iter().map(|&[r, g, b, _]| r.max(g).max(b)).collect(),
+        };
+        Packet {
+            width: self.w as u16,
+            height: self.h as u16,
+            encoding,
+            data,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+pub struct Crop {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+impl Default for Crop {
+    fn default() -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            w: 1.0,
+            h: 1.0,
+        }
+    }
+}
+
+impl Crop {
+    pub fn pixels(&self, w: usize, h: usize) -> (usize, usize, usize, usize) {
+        let span = |o: f32, s: f32, n: usize| {
+            let o = o.clamp(0.0, 1.0);
+            let s = s.clamp(0.0, 1.0 - o);
+            let start = ((o * n as f32) as usize).min(n.saturating_sub(1));
+            let len = ((s * n as f32).round() as usize).clamp(1, n - start);
+            (start, len)
+        };
+        let (x0, cw) = span(self.x, self.w, w);
+        let (y0, ch) = span(self.y, self.h, h);
+        (x0, y0, cw, ch)
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -28,6 +83,7 @@ pub enum Palette {
 #[serde(default)]
 pub struct FlirSettings {
     pub sensor_width: usize,
+    pub crop: Crop,
     pub weights: [f32; 3],
     pub sky_suppression: f32,
     pub persistence: f32,
@@ -49,7 +105,6 @@ pub struct FlirSettings {
     pub noise: f32,
     pub fpn: f32,
     pub vignette: f32,
-    pub smooth_display: bool,
     pub show_source: bool,
     pub horizon: HorizonSettings,
     pub capture_hdr: bool,
@@ -59,6 +114,7 @@ impl Default for FlirSettings {
     fn default() -> Self {
         Self {
             sensor_width: 640,
+            crop: Crop::default(),
             weights: [0.45, 0.45, 0.10],
             sky_suppression: 1.5,
             persistence: 0.3,
@@ -80,7 +136,6 @@ impl Default for FlirSettings {
             noise: 0.03,
             fpn: 0.012,
             vignette: 0.3,
-            smooth_display: true,
             show_source: false,
             horizon: HorizonSettings::default(),
             capture_hdr: true,
@@ -88,7 +143,6 @@ impl Default for FlirSettings {
     }
 }
 
-#[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PixelFormat {
     Rgba8,
@@ -96,7 +150,6 @@ pub enum PixelFormat {
     Rgba16F,
 }
 
-#[cfg_attr(not(windows), allow(dead_code))]
 pub fn downsample_raw(
     src: &[u8],
     w: usize,
@@ -104,7 +157,9 @@ pub fn downsample_raw(
     pitch: usize,
     fmt: PixelFormat,
     out_w: usize,
+    crop: Crop,
 ) -> SourceFrame {
+    let (x0, y0, w, h) = crop.pixels(w, h);
     match fmt {
         PixelFormat::Rgba8 | PixelFormat::Bgra8 => {
             let (ri, bi) = if fmt == PixelFormat::Bgra8 {
@@ -117,7 +172,7 @@ pub fn downsample_raw(
                 h,
                 out_w,
                 |x, y| {
-                    let i = y * pitch + x * 4;
+                    let i = (y0 + y) * pitch + (x0 + x) * 4;
                     if i + 3 < src.len() {
                         [src[i + ri] as f32, src[i + 1] as f32, src[i + bi] as f32]
                     } else {
@@ -134,7 +189,7 @@ pub fn downsample_raw(
                 h,
                 out_w,
                 |x, y| {
-                    let i = y * pitch + x * 8;
+                    let i = (y0 + y) * pitch + (x0 + x) * 8;
                     if i + 7 < src.len() {
                         [half(i), half(i + 2), half(i + 4)]
                     } else {
@@ -270,6 +325,11 @@ fn ironbow(v: f32) -> [f32; 3] {
     STOPS[5].1
 }
 
+fn to_rgba8(c: [f32; 3]) -> [u8; 4] {
+    let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0) as u8;
+    [q(c[0]), q(c[1]), q(c[2]), 255]
+}
+
 fn palette_rgb(p: Palette, v: f32) -> [f32; 3] {
     match p {
         Palette::Gray => [v, v, v],
@@ -284,24 +344,14 @@ impl FlirProcessor {
         *self = Self::default();
     }
 
-    pub fn process(&mut self, src: &SourceFrame, s: &FlirSettings) -> ColorImage {
+    pub fn process(&mut self, src: &SourceFrame, s: &FlirSettings) -> FlirImage {
         let (w, h) = (src.w, src.h);
         let n = w * h;
         self.frame = self.frame.wrapping_add(1);
 
         if s.show_source {
-            let px = src
-                .rgb
-                .iter()
-                .map(|c| {
-                    Color32::from_rgb(
-                        (c[0] * 255.0) as u8,
-                        (c[1] * 255.0) as u8,
-                        (c[2] * 255.0) as u8,
-                    )
-                })
-                .collect();
-            return ColorImage::new([w, h], px);
+            let rgba = src.rgb.iter().map(|&c| to_rgba8(c)).collect();
+            return FlirImage { w, h, rgba };
         }
 
         let [wr, wg, wb] = s.weights;
@@ -464,7 +514,7 @@ impl FlirProcessor {
         };
         let detail_k = 1.0 + s.detail;
 
-        let pixels: Vec<Color32> = heat
+        let rgba: Vec<[u8; 4]> = heat
             .par_iter()
             .enumerate()
             .map(|(i, &v)| {
@@ -492,18 +542,13 @@ impl FlirProcessor {
                 let (dx, dy) = (x as f32 - cx, y as f32 - cy);
                 v *= 1.0 - s.vignette * (dx * dx + dy * dy) * inv_r2;
                 if !line.is_empty() && line[i][2].abs() < line_px_deg {
-                    return Color32::RED;
+                    return [255, 0, 0, 255];
                 }
-                let c = palette_rgb(s.palette, v.clamp(0.0, 1.0));
-                Color32::from_rgb(
-                    (c[0].clamp(0.0, 1.0) * 255.0) as u8,
-                    (c[1].clamp(0.0, 1.0) * 255.0) as u8,
-                    (c[2].clamp(0.0, 1.0) * 255.0) as u8,
-                )
+                to_rgba8(palette_rgb(s.palette, v.clamp(0.0, 1.0)))
             })
             .collect();
 
-        ColorImage::new([w, h], pixels)
+        FlirImage { w, h, rgba }
     }
 }
 
@@ -526,12 +571,43 @@ mod tests {
                 }
             }
         }
-        let f = downsample_raw(&buf, w, h, pitch, PixelFormat::Rgba16F, w);
+        let f = downsample_raw(&buf, w, h, pitch, PixelFormat::Rgba16F, w, Crop::default());
         assert_eq!((f.w, f.h), (w, h));
         let v: Vec<f32> = [0, 8, 16, 24].iter().map(|&x| f.rgb[x][0]).collect();
 
         assert!(v[0] > 0.0 && v[1] > v[0], "shadow levels collapsed: {v:?}");
         assert!((v[2] - 1.0).abs() < 1e-3);
         assert!(v[3] > 1.5, "HDR clipped: {v:?}");
+    }
+
+    #[test]
+    fn crop_selects_region() {
+        let (w, h) = (40usize, 20usize);
+        let mut buf = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 20..w {
+                buf[(y * w + x) * 4] = 255;
+            }
+        }
+        let crop = Crop {
+            x: 0.5,
+            y: 0.0,
+            w: 0.5,
+            h: 1.0,
+        };
+        let f = downsample_raw(&buf, w, h, w * 4, PixelFormat::Rgba8, 20, crop);
+        assert_eq!((f.w, f.h), (20, 20));
+        assert!(f.rgb.iter().all(|c| c[0] == 1.0));
+    }
+
+    #[test]
+    fn gray_packet_keeps_palette_intensity() {
+        let img = FlirImage {
+            w: 2,
+            h: 1,
+            rgba: vec![[10, 200, 5, 255], [90, 90, 90, 255]],
+        };
+        assert_eq!(img.packet(Encoding::Gray8).data, vec![200, 90]);
+        assert_eq!(img.packet(Encoding::Rgba8).data.len(), 8);
     }
 }
