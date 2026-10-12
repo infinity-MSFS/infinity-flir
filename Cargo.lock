@@ -1634,6 +1634,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "half",
+ "miniz_oxide 0.8.9",
  "rayon",
  "serde",
  "windows-capture",

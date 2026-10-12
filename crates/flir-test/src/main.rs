@@ -32,6 +32,10 @@ fn main() -> eframe::Result {
     )
 }
 
+/// The MD-10 HUD's symbology green, `display_md_hud::symbology::INK`
+/// (70, 255, 110) in 10-systems, as sRGB 0..1.
+const MD10_HUD_INK: [f32; 3] = [70.0 / 255.0, 1.0, 110.0 / 255.0];
+
 fn arg(args: &[String], name: &str) -> Option<String> {
     args.iter()
         .position(|a| a == name)
@@ -52,6 +56,9 @@ fn load_still(path: &str, s: &FlirSettings) -> Result<SourceFrame, String> {
 
 fn headless(input: &str, output: &str) {
     let mut s = FlirSettings::default();
+    if std::env::args().any(|a| a == "--ink-reject") {
+        s.ink_reject = Some(MD10_HUD_INK);
+    }
     if std::env::args().any(|a| a == "--linear") {
         s.log_domain = false;
         s.equalize = 0.0;
@@ -320,6 +327,22 @@ impl App {
                 if ui.button("Reset crop").clicked() {
                     *c = Crop::default();
                 }
+            });
+
+        egui::CollapsingHeader::new("HUD ink reject")
+            .default_open(true)
+            .show(ui, |ui| {
+                let mut on = s.ink_reject.is_some();
+                if ui.checkbox(&mut on, "Remove the HUD's own light").changed() {
+                    s.ink_reject = on.then_some(MD10_HUD_INK);
+                }
+                if let Some(ink) = s.ink_reject.as_mut() {
+                    ui.horizontal(|ui| {
+                        ui.color_edit_button_rgb(ink);
+                        ui.label("ink");
+                    });
+                }
+                ui.add(Slider::new(&mut s.ink_mask, 0.0..=1.0).text("stroke refill above"));
             });
 
         egui::CollapsingHeader::new("Heat proxy")

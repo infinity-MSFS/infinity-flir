@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::horizon::{HorizonCache, HorizonSettings};
 use crate::stream::{Encoding, Packet};
+use crate::warp::Warp;
 
 pub struct SourceFrame {
     pub w: usize,
@@ -20,7 +21,11 @@ impl FlirImage {
     pub fn packet(&self, encoding: Encoding) -> Packet {
         let data = match encoding {
             Encoding::Rgba8 => self.rgba.as_flattened().to_vec(),
-            Encoding::Gray8 => self.rgba.iter().map(|&[r, g, b, _]| r.max(g).max(b)).collect(),
+            Encoding::Gray8 => self
+                .rgba
+                .iter()
+                .map(|&[r, g, b, _]| r.max(g).max(b))
+                .collect(),
         };
         Packet {
             width: self.w as u16,
@@ -108,6 +113,16 @@ pub struct FlirSettings {
     pub show_source: bool,
     pub horizon: HorizonSettings,
     pub capture_hdr: bool,
+    /// The HUD ink to take back out of the capture ([`reject_ink`]), sRGB
+    /// 0..1; `None` leaves the capture as it is.
+    pub ink_reject: Option<[f32; 3]>,
+    /// [`reject_ink`]'s refill threshold, linear ink; `<= 0` turns it off.
+    pub ink_mask: f32,
+    /// Resample the capture through this instead of `crop`'s rectangle
+    /// ([`downsample_warped`]). Set per frame by the host from the camera,
+    /// so never read from or written to a settings file.
+    #[serde(skip)]
+    pub warp: Option<Warp>,
 }
 
 impl Default for FlirSettings {
@@ -139,6 +154,9 @@ impl Default for FlirSettings {
             show_source: false,
             horizon: HorizonSettings::default(),
             capture_hdr: true,
+            ink_reject: None,
+            ink_mask: 0.35,
+            warp: None,
         }
     }
 }
@@ -200,6 +218,206 @@ pub fn downsample_raw(
             )
         }
     }
+}
+
+/// Most taps per axis a warped output pixel averages.
+const MAX_WARP_TAPS: usize = 4;
+
+/// Resample `src` through `warp`: output pixel `(u, v)` averages the source
+/// around `warp.map(u, v)`, which is a point in `crop` — the region of the
+/// capture that is the sim's render viewport (the whole frame for a
+/// borderless window). A point off the viewport or behind the eye reads
+/// black, which the HUD draws as clear.
+#[allow(clippy::too_many_arguments)]
+pub fn downsample_warped(
+    src: &[u8],
+    w: usize,
+    h: usize,
+    pitch: usize,
+    fmt: PixelFormat,
+    out_w: usize,
+    crop: Crop,
+    warp: &Warp,
+) -> SourceFrame {
+    let (vx, vy, vw, vh) = crop.pixels(w, h);
+    let out_w = out_w.clamp(16, 4096);
+    let out_h = warp.out_h(out_w);
+
+    // Taps from the warp's footprint: the viewport pixels its unit square
+    // spans per output pixel, measured along the top and left edges.
+    let span = |a: Option<(f32, f32)>, b: Option<(f32, f32)>| match (a, b) {
+        (Some(a), Some(b)) => ((a.0 - b.0) * vw as f32).hypot((a.1 - b.1) * vh as f32),
+        _ => 0.0,
+    };
+    let fx = span(warp.map(0.0, 0.0), warp.map(1.0, 0.0)) / out_w as f32;
+    let fy = span(warp.map(0.0, 0.0), warp.map(0.0, 1.0)) / out_h as f32;
+    let taps = |f: f32| {
+        if f.is_finite() {
+            (f.ceil().max(1.0) as usize).min(MAX_WARP_TAPS)
+        } else {
+            1
+        }
+    };
+    let (tx_n, ty_n) = (taps(fx), taps(fy));
+    let norm = 1.0 / (tx_n * ty_n) as f32;
+
+    let read = |x: usize, y: usize| -> [f32; 3] {
+        match fmt {
+            PixelFormat::Rgba8 | PixelFormat::Bgra8 => {
+                let (ri, bi) = if fmt == PixelFormat::Bgra8 {
+                    (2, 0)
+                } else {
+                    (0, 2)
+                };
+                let i = y * pitch + x * 4;
+                match src.get(i..i + 4) {
+                    Some(p) => [p[ri], p[1], p[bi]].map(|c| f32::from(c) / 255.0),
+                    None => [0.0; 3],
+                }
+            }
+            PixelFormat::Rgba16F => {
+                let i = y * pitch + x * 8;
+                match src.get(i..i + 6) {
+                    Some(p) => [0, 2, 4].map(|o| {
+                        let v = half::f16::from_le_bytes([p[o], p[o + 1]]).to_f32();
+                        if v.is_finite() {
+                            v.max(0.0).powf(1.0 / 2.2)
+                        } else {
+                            0.0
+                        }
+                    }),
+                    None => [0.0; 3],
+                }
+            }
+        }
+    };
+
+    let mut rgb = vec![[0.0f32; 3]; out_w * out_h];
+    rgb.par_chunks_mut(out_w).enumerate().for_each(|(oy, row)| {
+        for (ox, px) in row.iter_mut().enumerate() {
+            let mut acc = [0f32; 3];
+            for ty in 0..ty_n {
+                let v = (oy as f32 + (ty as f32 + 0.5) / ty_n as f32) / out_h as f32;
+                for tx in 0..tx_n {
+                    let u = (ox as f32 + (tx as f32 + 0.5) / tx_n as f32) / out_w as f32;
+                    let Some((sx, sy)) = warp.map(u, v) else {
+                        continue;
+                    };
+                    let (x, y) = (sx * vw as f32, sy * vh as f32);
+                    if !(x >= 0.0 && y >= 0.0 && x < vw as f32 && y < vh as f32) {
+                        continue;
+                    }
+                    let c = read(vx + x as usize, vy + y as usize);
+                    acc[0] += c[0];
+                    acc[1] += c[1];
+                    acc[2] += c[2];
+                }
+            }
+            *px = acc.map(|v| v * norm);
+        }
+    });
+    SourceFrame {
+        w: out_w,
+        h: out_h,
+        rgb,
+    }
+}
+
+/// The sRGB transfer, approximated as the capture's own encode is.
+const GAMMA: f32 = 2.2;
+/// A captured channel at or above this is clipped, and the ink under it
+/// cannot be solved for.
+const CLIP_LEVEL: f32 = 0.98;
+/// Ink below this cannot be told from a green-leaning scene.
+const INK_MIN: f32 = 0.02;
+/// Radius, output pixels, a masked stroke is filled from.
+const INK_FILL_RADIUS_PX: usize = 2;
+/// A masked pixel with less than this fraction of clean neighbours keeps its
+/// own projected value rather than a fill from almost nothing.
+const INK_FILL_MIN_SUPPORT: f32 = 0.05;
+
+/// The HUD's own light, taken back out of a capture that looks through it.
+///
+/// The combiner only ever ADDS one colour, `ink` (sRGB, 0..1), so a captured
+/// pixel is `scene + k·ink` in linear light. Brightness measured along the
+/// direction `n` — the grey axis with its ink component projected out — has
+/// no ink in it at all: `L = c·n / (1,1,1)·n` is the same with or without
+/// the HUD, whatever was drawn. The ink beyond a grey of that brightness,
+/// `k = c·î − L·(1,1,1)·î`, is removed, never added: a scene that is LESS
+/// green than grey (a blue sky) is left alone, and a green one (grass by
+/// day) is pulled toward grey — the cost of the method.
+///
+/// Where a stroke clipped a channel, or the ink is above `mask` (tonemapping
+/// is not additive), the projection is not exact; those pixels and a
+/// one-pixel border are refilled from their clean neighbours. `mask <= 0`
+/// turns the refill off.
+pub fn reject_ink(src: &SourceFrame, ink: [f32; 3], mask: f32) -> Vec<[f32; 3]> {
+    let (w, h) = (src.w, src.h);
+    let lin = |c: f32| {
+        if c.is_finite() {
+            c.max(0.0).powf(GAMMA)
+        } else {
+            0.0
+        }
+    };
+    let enc = |c: f32| c.max(0.0).powf(1.0 / GAMMA);
+    let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+
+    let ink = ink.map(lin);
+    let ink_len = dot(ink, ink).sqrt();
+    if !(ink_len.is_finite() && ink_len > 1e-6) {
+        return src.rgb.clone();
+    }
+    let i_hat = ink.map(|c| c / ink_len);
+    let grey = [1.0; 3];
+    let gi = dot(grey, i_hat);
+    let n = [0, 1, 2].map(|k| grey[k] - gi * i_hat[k]);
+    let gn = dot(grey, n);
+    if !(gn.is_finite() && gn > 1e-6) {
+        // The ink IS grey: nothing separates it from the scene.
+        return src.rgb.clone();
+    }
+
+    let solved: Vec<([f32; 3], bool)> = src
+        .rgb
+        .par_iter()
+        .map(|&c| {
+            let cl = c.map(lin);
+            let l = dot(cl, n) / gn;
+            let k = (dot(cl, i_hat) - l * gi).max(0.0);
+            let clean = [0, 1, 2].map(|j| enc(cl[j] - k * i_hat[j]));
+            let clipped = c.iter().any(|&v| v >= CLIP_LEVEL) && k > INK_MIN;
+            let bad = mask > 0.0 && (clipped || k > mask);
+            (clean, bad)
+        })
+        .collect();
+
+    let mut clean: Vec<[f32; 3]> = solved.iter().map(|s| s.0).collect();
+    if mask <= 0.0 || !solved.iter().any(|s| s.1) {
+        return clean;
+    }
+
+    // Grow the mask a pixel (a stroke's antialiased edge is ink too), then
+    // fill it by normalised convolution of the clean pixels around it.
+    let (mut tmp, mut grown, mut support) = (Vec::new(), Vec::new(), Vec::new());
+    let raw: Vec<f32> = solved.iter().map(|s| f32::from(u8::from(s.1))).collect();
+    box_blur(&raw, w, h, 1, &mut tmp, &mut grown);
+    let valid: Vec<f32> = grown
+        .iter()
+        .map(|&g| f32::from(u8::from(g <= 0.0)))
+        .collect();
+    box_blur(&valid, w, h, INK_FILL_RADIUS_PX, &mut tmp, &mut support);
+    let mut sums = Vec::new();
+    for ch in 0..3 {
+        let weighted: Vec<f32> = clean.iter().zip(&valid).map(|(c, v)| c[ch] * v).collect();
+        box_blur(&weighted, w, h, INK_FILL_RADIUS_PX, &mut tmp, &mut sums);
+        for (i, px) in clean.iter_mut().enumerate() {
+            if valid[i] == 0.0 && support[i] > INK_FILL_MIN_SUPPORT {
+                px[ch] = sums[i] / support[i];
+            }
+        }
+    }
+    clean
 }
 
 pub fn downsample_with<F, E>(w: usize, h: usize, out_w: usize, sample: F, encode: E) -> SourceFrame
@@ -349,8 +567,17 @@ impl FlirProcessor {
         let n = w * h;
         self.frame = self.frame.wrapping_add(1);
 
+        let rejected;
+        let rgb: &[[f32; 3]] = match s.ink_reject {
+            Some(ink) => {
+                rejected = reject_ink(src, ink, s.ink_mask);
+                &rejected
+            }
+            None => &src.rgb,
+        };
+
         if s.show_source {
-            let rgba = src.rgb.iter().map(|&c| to_rgba8(c)).collect();
+            let rgba = rgb.iter().map(|&c| to_rgba8(c)).collect();
             return FlirImage { w, h, rgba };
         }
 
@@ -373,8 +600,7 @@ impl FlirProcessor {
         } else {
             &[]
         };
-        let mut heat: Vec<f32> = src
-            .rgb
+        let mut heat: Vec<f32> = rgb
             .par_iter()
             .enumerate()
             .map(|(i, &[r, g, b])| {
@@ -598,6 +824,139 @@ mod tests {
         let f = downsample_raw(&buf, w, h, w * 4, PixelFormat::Rgba8, 20, crop);
         assert_eq!((f.w, f.h), (20, 20));
         assert!(f.rgb.iter().all(|c| c[0] == 1.0));
+    }
+
+    const INK: [f32; 3] = [70.0 / 255.0, 1.0, 110.0 / 255.0];
+
+    fn frame(rgb: Vec<[f32; 3]>, w: usize) -> SourceFrame {
+        SourceFrame {
+            w,
+            h: rgb.len() / w,
+            rgb,
+        }
+    }
+
+    /// Add `k` of the ink to an encoded pixel, in linear light — what the
+    /// collimated shader does to the scene behind it.
+    fn plus_ink(c: [f32; 3], k: f32) -> [f32; 3] {
+        [0, 1, 2].map(|j| (c[j].powf(GAMMA) + k * INK[j].powf(GAMMA)).powf(1.0 / GAMMA))
+    }
+
+    #[test]
+    fn the_huds_light_on_a_grey_scene_comes_back_out() {
+        let scene = [0.3, 0.3, 0.3];
+        let src = frame(vec![scene, plus_ink(scene, 0.2), plus_ink(scene, 0.05)], 3);
+        let out = reject_ink(&src, INK, 0.0);
+        for (i, px) in out.iter().enumerate() {
+            for j in 0..3 {
+                assert!((px[j] - scene[j]).abs() < 1e-3, "{i}: {px:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn ink_on_black_is_black_and_a_blue_sky_is_untouched() {
+        let src = frame(vec![plus_ink([0.0; 3], 0.4), [0.2, 0.3, 0.7]], 2);
+        let out = reject_ink(&src, INK, 0.0);
+        assert!(out[0].iter().all(|&v| v < 1e-3), "{:?}", out[0]);
+        for j in 0..3 {
+            assert!((out[1][j] - src.rgb[1][j]).abs() < 1e-4, "{:?}", out[1]);
+        }
+    }
+
+    #[test]
+    fn a_clipped_stroke_is_refilled_from_its_neighbours() {
+        let (w, h) = (9, 9);
+        let scene = [0.4, 0.4, 0.4];
+        let mut rgb = vec![scene; w * h];
+        rgb[4 * w + 4] = [0.9, 1.0, 0.95]; // a stroke that clipped green
+        let out = reject_ink(&frame(rgb, w), INK, 0.35);
+        for j in 0..3 {
+            assert!(
+                (out[4 * w + 4][j] - 0.4).abs() < 1e-3,
+                "{:?}",
+                out[4 * w + 4]
+            );
+        }
+    }
+
+    #[test]
+    fn garbage_ink_leaves_the_frame_alone() {
+        let src = frame(vec![[0.1, 0.5, f32::NAN]], 1);
+        assert_eq!(reject_ink(&src, [0.0; 3], 0.35).len(), 1);
+        assert_eq!(reject_ink(&src, [1.0; 3], 0.35).len(), 1);
+        let out = reject_ink(&src, INK, 0.35);
+        assert!(out[0].iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn the_warp_resamples_the_quad_it_names() {
+        // Right half of the frame red, left black; a warp onto the right
+        // half sees only red, and one past the frame's edge sees black.
+        let (w, h) = (64usize, 32usize);
+        let mut buf = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in w / 2..w {
+                buf[(y * w + x) * 4] = 255;
+            }
+        }
+        let right =
+            Warp::from_corners([(0.5, 0.0), (1.0, 0.0), (1.0, 1.0), (0.5, 1.0)], 1.0).unwrap();
+        let f = downsample_warped(
+            &buf,
+            w,
+            h,
+            w * 4,
+            PixelFormat::Rgba8,
+            16,
+            Crop::default(),
+            &right,
+        );
+        assert_eq!((f.w, f.h), (16, 16));
+        assert!(f.rgb.iter().all(|c| (c[0] - 1.0).abs() < 1e-6), "all red");
+
+        let off =
+            Warp::from_corners([(1.0, 0.0), (2.0, 0.0), (2.0, 1.0), (1.0, 1.0)], 0.5).unwrap();
+        let f = downsample_warped(
+            &buf,
+            w,
+            h,
+            w * 4,
+            PixelFormat::Rgba8,
+            16,
+            Crop::default(),
+            &off,
+        );
+        assert_eq!((f.w, f.h), (16, 8));
+        assert!(f.rgb.iter().all(|c| c[0] == 0.0), "off-screen is black");
+    }
+
+    #[test]
+    fn the_warp_is_relative_to_the_viewport_crop() {
+        // A 4-px title bar of white above a black viewport.
+        let (w, h) = (32usize, 36usize);
+        let mut buf = vec![0u8; w * h * 4];
+        buf[..w * 4 * 4].fill(255);
+        let crop = Crop {
+            x: 0.0,
+            y: 4.0 / 36.0,
+            w: 1.0,
+            h: 32.0 / 36.0,
+        };
+        let f = downsample_warped(
+            &buf,
+            w,
+            h,
+            w * 4,
+            PixelFormat::Rgba8,
+            16,
+            crop,
+            &Warp::IDENTITY,
+        );
+        assert!(
+            f.rgb.iter().all(|c| c[0] == 0.0),
+            "the title bar is not the scene"
+        );
     }
 
     #[test]

@@ -43,3 +43,10 @@ if let Some(Ok(packet)) = rx.push(serde_json::from_value(payload)?) {
 ```
 
 Packet layout: `"FL"`, encoding (`0` Gray8, `1` Rgba8), pad, width u16 LE, height u16 LE, pixels.
+
+## Looking through a HUD
+
+A host filming the sim window through a collimated HUD sets two things per frame:
+
+- `FlirSettings::warp` — a `Warp` (3x3 homography, output unit square -> viewport unit square) that resamples only the region behind the HUD onto the HUD's own pixel grid (`downsample_warped`). `crop` then names the sim's render viewport inside the capture. Off-screen and behind-the-eye samples read black. `Feed::source_size` gives the capture size the warp is built for.
+- `FlirSettings::ink_reject` — the HUD's ink colour (sRGB 0..1). The HUD only ADDS that colour, so `reject_ink` measures brightness along a colour axis with no ink in it and removes the HUD's own light (symbology and the previous FLIR frame) before filtering; clipped strokes above `ink_mask` are refilled from their neighbours. `flir-test --ink-reject` (or the GUI's HUD ink reject panel) exercises it with the MD-10's green.

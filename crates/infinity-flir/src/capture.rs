@@ -3,14 +3,19 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use crate::flir::{Crop, FlirSettings, SourceFrame};
+use crate::warp::Warp;
 
 type Notify = Box<dyn Fn() + Send + Sync>;
 
 struct Shared {
     latest: Mutex<Option<SourceFrame>>,
     ready: Condvar,
-    geometry: Mutex<(usize, Crop)>,
+    /// Output width, the render viewport within the capture, and the warp
+    /// that replaces the viewport's rectangle when the host has one.
+    geometry: Mutex<(usize, Crop, Option<Warp>)>,
     frames: AtomicU64,
+    /// The last captured frame's size, pixels, before any crop or warp.
+    size: Mutex<Option<(usize, usize)>>,
     notify: Mutex<Option<Notify>>,
 }
 
@@ -35,8 +40,9 @@ impl Feed {
         let shared = Arc::new(Shared {
             latest: Mutex::new(None),
             ready: Condvar::new(),
-            geometry: Mutex::new((s.sensor_width, s.crop)),
+            geometry: Mutex::new((s.sensor_width, s.crop, s.warp)),
             frames: AtomicU64::new(0),
+            size: Mutex::new(None),
             notify: Mutex::new(None),
         });
         let handle = imp::start(target, shared.clone(), s.capture_hdr)?;
@@ -47,7 +53,7 @@ impl Feed {
     }
 
     pub fn configure(&self, s: &FlirSettings) {
-        *self.shared.geometry.lock().unwrap() = (s.sensor_width, s.crop);
+        *self.shared.geometry.lock().unwrap() = (s.sensor_width, s.crop, s.warp);
     }
 
     pub fn on_frame(&self, f: impl Fn() + Send + Sync + 'static) {
@@ -71,6 +77,12 @@ impl Feed {
     pub fn frames(&self) -> u64 {
         self.shared.frames.load(Ordering::Relaxed)
     }
+
+    /// The captured window's size, pixels, once a frame has arrived — what
+    /// a host needs to build a [`Warp`] for its viewport.
+    pub fn source_size(&self) -> Option<(usize, usize)> {
+        *self.shared.size.lock().unwrap()
+    }
 }
 
 pub fn find_window(title: &str) -> Option<Target> {
@@ -83,7 +95,7 @@ pub fn find_window(title: &str) -> Option<Target> {
 #[cfg(windows)]
 mod imp {
     use super::Shared;
-    use crate::flir::{PixelFormat, downsample_raw};
+    use crate::flir::{PixelFormat, downsample_raw, downsample_warped};
     use std::sync::Arc;
     use windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
     use windows_capture::frame::Frame;
@@ -150,14 +162,19 @@ mod imp {
             frame: &mut Frame,
             _control: InternalCaptureControl,
         ) -> Result<(), Self::Error> {
-            let (out_w, crop) = *self.shared.geometry.lock().unwrap();
+            let (out_w, crop, warp) = *self.shared.geometry.lock().unwrap();
             let mut buf = frame.buffer()?;
             let (w, h, pitch) = (
                 buf.width() as usize,
                 buf.height() as usize,
                 buf.row_pitch() as usize,
             );
-            let sf = downsample_raw(buf.as_raw_buffer(), w, h, pitch, self.fmt, out_w, crop);
+            *self.shared.size.lock().unwrap() = Some((w, h));
+            let raw = buf.as_raw_buffer();
+            let sf = match warp {
+                Some(warp) => downsample_warped(raw, w, h, pitch, self.fmt, out_w, crop, &warp),
+                None => downsample_raw(raw, w, h, pitch, self.fmt, out_w, crop),
+            };
             self.shared.publish(sf);
             Ok(())
         }
