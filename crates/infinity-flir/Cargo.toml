@@ -6,7 +6,7 @@ edition.workspace = true
 [features]
 default = ["capture"]
 process = ["dep:rayon", "dep:half"]
-capture = ["process", "dep:windows-capture"]
+capture = ["process", "dep:windows-capture", "dep:windows"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -17,3 +17,11 @@ half = { version = "2", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-capture = { version = "2", optional = true }
+# The window's client area within what WGC captures (`capture::client_crop`).
+# Already in the tree through windows-capture; named for the three calls.
+windows = { version = "0.62", optional = true, features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Dwm",
+  "Win32_Graphics_Gdi",
+  "Win32_UI_WindowsAndMessaging",
+] }

@@ -16,6 +16,11 @@ struct Shared {
     frames: AtomicU64,
     /// The last captured frame's size, pixels, before any crop or warp.
     size: Mutex<Option<(usize, usize)>>,
+    /// Where the window's CLIENT area sits in the captured frame. A
+    /// windowed sim's capture carries its title bar and borders, and every
+    /// crop and warp is of the client area, which is what the game renders.
+    /// The whole frame for a monitor or a borderless window.
+    client: Mutex<Crop>,
     notify: Mutex<Option<Notify>>,
 }
 
@@ -43,6 +48,7 @@ impl Feed {
             geometry: Mutex::new((s.sensor_width, s.crop, s.warp)),
             frames: AtomicU64::new(0),
             size: Mutex::new(None),
+            client: Mutex::new(Crop::default()),
             notify: Mutex::new(None),
         });
         let handle = imp::start(target, shared.clone(), s.capture_hdr)?;
@@ -83,6 +89,13 @@ impl Feed {
     pub fn source_size(&self) -> Option<(usize, usize)> {
         *self.shared.size.lock().unwrap()
     }
+
+    /// `crop` as the capture applies it: inside the window's client area.
+    /// A host sizing a [`Warp`] for the viewport takes the viewport's pixels
+    /// from this, not from `crop` alone.
+    pub fn viewport(&self, crop: Crop) -> Crop {
+        crop.within(*self.shared.client.lock().unwrap())
+    }
 }
 
 pub fn find_window(title: &str) -> Option<Target> {
@@ -95,7 +108,7 @@ pub fn find_window(title: &str) -> Option<Target> {
 #[cfg(windows)]
 mod imp {
     use super::Shared;
-    use crate::flir::{PixelFormat, downsample_raw, downsample_warped};
+    use crate::flir::{Crop, PixelFormat, downsample_raw, downsample_warped};
     use std::sync::Arc;
     use windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
     use windows_capture::frame::Frame;
@@ -143,18 +156,88 @@ mod imp {
         out
     }
 
+    /// Frames between re-reads of the window's client area: a window is
+    /// resized rarely, and three Win32 calls a frame are not free.
+    const CLIENT_EVERY_FRAMES: u64 = 30;
+
+    /// Where `hwnd`'s client area lies in a `frame_w × frame_h` capture of
+    /// it, as a fraction of the frame. WGC captures the window's visible
+    /// bounds (`DWMWA_EXTENDED_FRAME_BOUNDS`): title bar and borders
+    /// included. `None` when the window cannot be asked or the answer does
+    /// not fit the frame — the caller then keeps the whole frame.
+    fn client_crop(hwnd: usize, frame_w: usize, frame_h: usize) -> Option<Crop> {
+        use windows::Win32::Foundation::{HWND, POINT, RECT};
+        use windows::Win32::Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
+        use windows::Win32::Graphics::Gdi::ClientToScreen;
+        use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
+
+        let hwnd = HWND(hwnd as *mut std::ffi::c_void);
+        let mut bounds = RECT::default();
+        let mut client = RECT::default();
+        let mut origin = POINT { x: 0, y: 0 };
+        // SAFETY: plain Win32 queries on a window handle WGC is capturing;
+        // each writes only the struct it is handed.
+        unsafe {
+            DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_EXTENDED_FRAME_BOUNDS,
+                (&mut bounds as *mut RECT).cast(),
+                std::mem::size_of::<RECT>() as u32,
+            )
+            .ok()?;
+            GetClientRect(hwnd, &mut client).ok()?;
+            if !ClientToScreen(hwnd, &mut origin).as_bool() {
+                return None;
+            }
+        }
+        let (bw, bh) = (bounds.right - bounds.left, bounds.bottom - bounds.top);
+        if bw <= 0 || bh <= 0 || frame_w == 0 || frame_h == 0 {
+            return None;
+        }
+        // The capture may be scaled from the bounds (DPI); scale with it.
+        let sx = frame_w as f64 / f64::from(bw);
+        let sy = frame_h as f64 / f64::from(bh);
+        let x = f64::from(origin.x - bounds.left) * sx;
+        let y = f64::from(origin.y - bounds.top) * sy;
+        let w = f64::from(client.right - client.left) * sx;
+        let h = f64::from(client.bottom - client.top) * sy;
+        let (fw, fh) = (frame_w as f64, frame_h as f64);
+        const SLACK_PX: f64 = 2.0;
+        let fits = x >= -SLACK_PX
+            && y >= -SLACK_PX
+            && x + w <= fw + SLACK_PX
+            && y + h <= fh + SLACK_PX
+            && w > fw * 0.5
+            && h > fh * 0.5;
+        fits.then(|| Crop {
+            x: (x.max(0.0) / fw) as f32,
+            y: (y.max(0.0) / fh) as f32,
+            w: (w.min(fw) / fw) as f32,
+            h: (h.min(fh) / fh) as f32,
+        })
+    }
+
     struct Handler {
         shared: Arc<Shared>,
         fmt: PixelFormat,
+        /// The window being captured, for its client area; `None` for a
+        /// monitor.
+        hwnd: Option<usize>,
+        seen: u64,
     }
 
     impl GraphicsCaptureApiHandler for Handler {
-        type Flags = (Arc<Shared>, PixelFormat);
+        type Flags = (Arc<Shared>, PixelFormat, Option<usize>);
         type Error = BoxErr;
 
         fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
-            let (shared, fmt) = ctx.flags;
-            Ok(Self { shared, fmt })
+            let (shared, fmt, hwnd) = ctx.flags;
+            Ok(Self {
+                shared,
+                fmt,
+                hwnd,
+                seen: 0,
+            })
         }
 
         fn on_frame_arrived(
@@ -170,6 +253,13 @@ mod imp {
                 buf.row_pitch() as usize,
             );
             *self.shared.size.lock().unwrap() = Some((w, h));
+            if let Some(hwnd) = self.hwnd
+                && self.seen.is_multiple_of(CLIENT_EVERY_FRAMES)
+            {
+                *self.shared.client.lock().unwrap() = client_crop(hwnd, w, h).unwrap_or_default();
+            }
+            self.seen = self.seen.wrapping_add(1);
+            let crop = crop.within(*self.shared.client.lock().unwrap());
             let raw = buf.as_raw_buffer();
             let sf = match warp {
                 Some(warp) => downsample_warped(raw, w, h, pitch, self.fmt, out_w, crop, &warp),
@@ -200,7 +290,11 @@ mod imp {
         } else {
             (PixelFormat::Rgba8, ColorFormat::Rgba8)
         };
-        let flags = (shared, fmt);
+        let hwnd = match target {
+            Target::Window(w) => Some(w.as_raw_hwnd() as usize),
+            Target::Monitor(_) => None,
+        };
+        let flags = (shared, fmt, hwnd);
         macro_rules! go {
             ($item:expr) => {
                 Handler::start_free_threaded(Settings::new(

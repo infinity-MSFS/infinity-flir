@@ -56,6 +56,18 @@ impl Default for Crop {
 }
 
 impl Crop {
+    /// This crop, taken inside `outer` rather than inside the whole frame:
+    /// a user's crop of the render viewport, composed with where that
+    /// viewport sits in the captured window.
+    pub fn within(&self, outer: Crop) -> Crop {
+        Crop {
+            x: outer.x + self.x * outer.w,
+            y: outer.y + self.y * outer.h,
+            w: self.w * outer.w,
+            h: self.h * outer.h,
+        }
+    }
+
     pub fn pixels(&self, w: usize, h: usize) -> (usize, usize, usize, usize) {
         let span = |o: f32, s: f32, n: usize| {
             let o = o.clamp(0.0, 1.0);
@@ -105,6 +117,9 @@ pub struct FlirSettings {
     pub gain: f32,
     pub level: f32,
     pub gamma: f32,
+    /// Scales the finished picture, 0..1. A host that draws the picture as
+    /// light over the world (a HUD) uses it as transparency.
+    pub brightness: f32,
     pub polarity: Polarity,
     pub palette: Palette,
     pub noise: f32,
@@ -146,6 +161,7 @@ impl Default for FlirSettings {
             gain: 1.0,
             level: 0.0,
             gamma: 1.0,
+            brightness: 1.0,
             polarity: Polarity::WhiteHot,
             palette: Palette::Green,
             noise: 0.03,
@@ -420,6 +436,180 @@ pub fn reject_ink(src: &SourceFrame, ink: [f32; 3], mask: f32) -> Vec<[f32; 3]> 
     clean
 }
 
+/// A stroke must stand this far above its 3×3 surround, linear green, to
+/// teach [`estimate_ink`] the HUD's colour.
+const INK_EDGE_MIN: f32 = 0.06;
+/// …and be this many times greener than it is red or blue.
+const INK_EDGE_GREEN_RATIO: f32 = 2.0;
+/// Fewer stroke pixels than this is no measurement.
+const INK_EDGE_MIN_PX: usize = 40;
+/// A measured ink further than this from the nominal one is not the HUD.
+const INK_MAX_DRIFT_DEG: f32 = 30.0;
+/// Two inks closer than this are one direction, not a plane.
+const INK_PLANE_MIN_DEG: f32 = 2.0;
+
+fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn unit3(a: [f32; 3]) -> Option<[f32; 3]> {
+    let l = dot3(a, a).sqrt();
+    (l.is_finite() && l > 1e-6).then(|| a.map(|c| c / l))
+}
+
+fn lin(c: f32) -> f32 {
+    if c.is_finite() {
+        c.max(0.0).powf(GAMMA)
+    } else {
+        0.0
+    }
+}
+
+/// The colour the HUD actually adds to the capture, measured from it: the
+/// mean direction, in linear light, of the fine green-dominant detail —
+/// strokes and the FLIR picture's own edges. Unit length; `None` when too
+/// few strokes are clean (unclipped) enough to say.
+///
+/// Why measure at all: MSFS's collimated HUD shader and its tonemapping do
+/// not put the gauge's ink on screen as drawn. Flown 13 Oct 2026, the light
+/// the strokes ADDED to a sky ran red/green 0.087 and blue/green 0.33 in
+/// linear light, against the ink's own 0.058 and 0.16 — bluer, and taking
+/// out the nominal ink left every stroke behind as a ghost.
+pub fn estimate_ink(src: &SourceFrame) -> Option<[f32; 3]> {
+    let (w, h) = (src.w, src.h);
+    if w < 3 || h < 3 {
+        return None;
+    }
+    let lin_px: Vec<[f32; 3]> = src.rgb.iter().map(|c| c.map(lin)).collect();
+    let mut sum = [0f64; 3];
+    let mut n = 0usize;
+    for y in 1..h - 1 {
+        for x in 1..w - 1 {
+            let i = y * w + x;
+            if src.rgb[i].iter().any(|&v| v >= CLIP_LEVEL) {
+                continue;
+            }
+            let mut mean = [0f32; 3];
+            for dy in 0..3 {
+                for dx in 0..3 {
+                    let c = lin_px[(y + dy - 1) * w + (x + dx - 1)];
+                    for k in 0..3 {
+                        mean[k] += c[k] / 9.0;
+                    }
+                }
+            }
+            let c = lin_px[i];
+            let d = [c[0] - mean[0], c[1] - mean[1], c[2] - mean[2]];
+            if d[1] > INK_EDGE_MIN
+                && d[0] >= 0.0
+                && d[2] >= 0.0
+                && d[1] > INK_EDGE_GREEN_RATIO * d[0].max(d[2])
+            {
+                for k in 0..3 {
+                    sum[k] += f64::from(d[k]);
+                }
+                n += 1;
+            }
+        }
+    }
+    if n < INK_EDGE_MIN_PX {
+        return None;
+    }
+    unit3(sum.map(|v| v as f32))
+}
+
+/// Brightness with none of the HUD's light in it, per pixel, ENCODED
+/// (gamma 2.2, as the capture is) — what the FLIR filters when it looks
+/// through its own combiner.
+///
+/// The HUD adds light along `ink` (the gauge's, sRGB) and, as measured,
+/// along `measured` (linear, unit — [`estimate_ink`]). Brightness is read
+/// along the one direction `n` orthogonal to both, so any mix of the two
+/// contributes nothing, whatever was drawn and however bright; with one
+/// direction (no measurement, or the two agree) it is [`reject_ink`]'s grey
+/// axis with the ink projected out. `n` is mostly RED: a sky reads darker
+/// and grass darker still, which is how a thermal picture draws them anyway.
+///
+/// Where a stroke clipped a channel the additive model fails; those pixels
+/// and a one-pixel border are refilled from clean neighbours, as in
+/// [`reject_ink`], when `mask > 0`.
+pub fn ink_free_luminance(
+    src: &SourceFrame,
+    ink: [f32; 3],
+    measured: Option<[f32; 3]>,
+    mask: f32,
+) -> Vec<f32> {
+    let (w, h) = (src.w, src.h);
+    let grey = [1.0f32; 3];
+    let plain = || src.rgb.iter().map(|c| dot3(*c, grey) / 3.0).collect();
+    let Some(i1) = unit3(ink.map(lin)) else {
+        return plain();
+    };
+    let cross = |a: [f32; 3], b: [f32; 3]| {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    };
+    let plane = measured
+        .and_then(unit3)
+        .filter(|m| dot3(*m, i1).clamp(-1.0, 1.0).acos().to_degrees() < INK_MAX_DRIFT_DEG)
+        .filter(|m| dot3(*m, i1).clamp(-1.0, 1.0).acos().to_degrees() > INK_PLANE_MIN_DEG)
+        .and_then(|m| unit3(cross(i1, m)));
+    let n = match plane {
+        Some(n) => {
+            if dot3(n, grey) < 0.0 {
+                n.map(|c| -c)
+            } else {
+                n
+            }
+        }
+        None => {
+            let gi = dot3(grey, i1);
+            [0, 1, 2].map(|k| grey[k] - gi * i1[k])
+        }
+    };
+    let gn = dot3(grey, n);
+    if !(gn.is_finite() && gn > 1e-3) {
+        return plain();
+    }
+    let gi1 = dot3(grey, i1);
+    let solved: Vec<(f32, bool)> = src
+        .rgb
+        .par_iter()
+        .map(|&c| {
+            let cl = c.map(lin);
+            let l = (dot3(cl, n) / gn).max(0.0);
+            // The light beyond a grey of that brightness, along the ink.
+            let k = (dot3(cl, i1) - l * gi1).max(0.0);
+            let clipped = c.iter().any(|&v| v >= CLIP_LEVEL) && k > INK_MIN;
+            (l.powf(1.0 / GAMMA), mask > 0.0 && (clipped || k > mask))
+        })
+        .collect();
+    let mut out: Vec<f32> = solved.iter().map(|s| s.0).collect();
+    if mask <= 0.0 || !solved.iter().any(|s| s.1) {
+        return out;
+    }
+    let (mut tmp, mut grown, mut support, mut sums) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let raw: Vec<f32> = solved.iter().map(|s| f32::from(u8::from(s.1))).collect();
+    box_blur(&raw, w, h, 1, &mut tmp, &mut grown);
+    let valid: Vec<f32> = grown
+        .iter()
+        .map(|&g| f32::from(u8::from(g <= 0.0)))
+        .collect();
+    box_blur(&valid, w, h, INK_FILL_RADIUS_PX, &mut tmp, &mut support);
+    let weighted: Vec<f32> = out.iter().zip(&valid).map(|(l, v)| l * v).collect();
+    box_blur(&weighted, w, h, INK_FILL_RADIUS_PX, &mut tmp, &mut sums);
+    for (i, px) in out.iter_mut().enumerate() {
+        if valid[i] == 0.0 && support[i] > INK_FILL_MIN_SUPPORT {
+            *px = sums[i] / support[i];
+        }
+    }
+    out
+}
+
 pub fn downsample_with<F, E>(w: usize, h: usize, out_w: usize, sample: F, encode: E) -> SourceFrame
 where
     F: Fn(usize, usize) -> [f32; 3] + Sync,
@@ -470,6 +660,22 @@ pub struct FlirProcessor {
     eq_lut: Vec<f32>,
     last_log: Option<bool>,
     horizon: HorizonCache,
+    /// The HUD's light as measured ([`estimate_ink`]), smoothed.
+    ink_est: Option<[f32; 3]>,
+}
+
+/// Frames between ink measurements: the HUD's colour changes with the
+/// light, not with the frame.
+const INK_ESTIMATE_EVERY: u32 = 8;
+/// How far one measurement moves the smoothed ink.
+const INK_ESTIMATE_BLEND: f32 = 0.3;
+
+impl FlirProcessor {
+    /// The HUD colour the ink rejection is using beyond the nominal one,
+    /// linear, unit — for a host's diagnostics. `None` until measured.
+    pub fn measured_ink(&self) -> Option<[f32; 3]> {
+        self.ink_est
+    }
 }
 
 #[inline]
@@ -567,17 +773,29 @@ impl FlirProcessor {
         let n = w * h;
         self.frame = self.frame.wrapping_add(1);
 
-        let rejected;
-        let rgb: &[[f32; 3]] = match s.ink_reject {
-            Some(ink) => {
-                rejected = reject_ink(src, ink, s.ink_mask);
-                &rejected
+        // Looking through the HUD: brightness with none of its light in it
+        // (`ink_free_luminance`), which replaces the colour weighting below.
+        let ink_free: Option<Vec<f32>> = s.ink_reject.map(|ink| {
+            if (self.ink_est.is_none() || self.frame.is_multiple_of(INK_ESTIMATE_EVERY))
+                && let Some(m) = estimate_ink(src)
+            {
+                self.ink_est = match self.ink_est {
+                    Some(p) => unit3(
+                        [0, 1, 2]
+                            .map(|k| p[k] * (1.0 - INK_ESTIMATE_BLEND) + m[k] * INK_ESTIMATE_BLEND),
+                    ),
+                    None => Some(m),
+                };
             }
-            None => &src.rgb,
-        };
+            ink_free_luminance(src, ink, self.ink_est, s.ink_mask)
+        });
+        let rgb: &[[f32; 3]] = &src.rgb;
 
         if s.show_source {
-            let rgba = rgb.iter().map(|&c| to_rgba8(c)).collect();
+            let rgba = match &ink_free {
+                Some(l) => l.iter().map(|&v| to_rgba8([v; 3])).collect(),
+                None => rgb.iter().map(|&c| to_rgba8(c)).collect(),
+            };
             return FlirImage { w, h, rgba };
         }
 
@@ -604,9 +822,15 @@ impl FlirProcessor {
             .par_iter()
             .enumerate()
             .map(|(i, &[r, g, b])| {
-                let hue_gate = ((g - r) / b.max(1e-3) * 4.0 + 0.5).clamp(0.0, 1.0);
-                let blueness = (b - r.max(g)).max(0.0) * hue_gate;
-                let mut h = wr * r + wg * g + wb * b - sky * blueness;
+                let mut h = match &ink_free {
+                    // Already sky-dark: see `ink_free_luminance`.
+                    Some(l) => l.get(i).copied().unwrap_or(0.0),
+                    None => {
+                        let hue_gate = ((g - r) / b.max(1e-3) * 4.0 + 0.5).clamp(0.0, 1.0);
+                        let blueness = (b - r.max(g)).max(0.0) * hue_gate;
+                        wr * r + wg * g + wb * b - sky * blueness
+                    }
+                };
                 let mut bg_t = 0.0;
                 if hz_on {
                     let [t, sky_w, _] = bg[i];
@@ -767,6 +991,7 @@ impl FlirProcessor {
                 v += s.fpn * fpn_cols[x];
                 let (dx, dy) = (x as f32 - cx, y as f32 - cy);
                 v *= 1.0 - s.vignette * (dx * dx + dy * dy) * inv_r2;
+                v *= s.brightness.clamp(0.0, 1.0);
                 if !line.is_empty() && line[i][2].abs() < line_px_deg {
                     return [255, 0, 0, 255];
                 }
@@ -878,6 +1103,59 @@ mod tests {
                 out[4 * w + 4]
             );
         }
+    }
+
+    /// What MSFS's HUD actually added, flown 13 Oct 2026, linear: bluer
+    /// than the gauge's ink.
+    fn flown_ink() -> [f32; 3] {
+        unit3([0.087, 1.0, 0.327]).unwrap()
+    }
+
+    /// A grey scene crossed by strokes of `dir` light (linear, unit) at
+    /// `k`, every fourth column — the shape `estimate_ink` learns from.
+    fn striped(dir: [f32; 3], k: f32) -> (SourceFrame, [f32; 3]) {
+        let scene = [0.35f32; 3];
+        let (w, h) = (32, 16);
+        let rgb = (0..w * h)
+            .map(|i| {
+                if (i % w) % 4 == 1 {
+                    [0, 1, 2].map(|j| (scene[j].powf(GAMMA) + k * dir[j]).powf(1.0 / GAMMA))
+                } else {
+                    scene
+                }
+            })
+            .collect();
+        (frame(rgb, w), scene)
+    }
+
+    #[test]
+    fn the_huds_real_colour_is_measured_from_its_strokes() {
+        let (src, _) = striped(flown_ink(), 0.4);
+        let m = estimate_ink(&src).expect("strokes enough to measure");
+        let angle = dot3(m, flown_ink()).clamp(-1.0, 1.0).acos().to_degrees();
+        assert!(angle < 1.0, "measured {m:?}, off by {angle}°");
+        // A plain grey frame teaches nothing.
+        assert!(estimate_ink(&frame(vec![[0.4; 3]; 64], 8)).is_none());
+    }
+
+    #[test]
+    fn a_stroke_in_the_measured_colour_leaves_no_ghost() {
+        let (src, scene) = striped(flown_ink(), 0.4);
+        let want = scene[0];
+        let worst = |l: &[f32]| l.iter().map(|v| (v - want).abs()).fold(0.0f32, f32::max);
+        let nominal_only = ink_free_luminance(&src, INK, None, 0.0);
+        let measured = ink_free_luminance(&src, INK, estimate_ink(&src), 0.0);
+        assert!(
+            worst(&nominal_only) > 0.02,
+            "the premise: the nominal ink alone leaves the stroke ({})",
+            worst(&nominal_only)
+        );
+        assert!(worst(&measured) < 2e-3, "ghost left: {}", worst(&measured));
+        // And the nominal ink is still taken out with the measured one in
+        // the plane.
+        let (nominal_src, _) = striped(unit3(INK.map(lin)).unwrap(), 0.4);
+        let l = ink_free_luminance(&nominal_src, INK, estimate_ink(&src), 0.0);
+        assert!(worst(&l) < 2e-3, "{}", worst(&l));
     }
 
     #[test]
