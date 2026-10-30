@@ -1,0 +1,34 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/flir-env",
+    "crates/flir-live",
+    "crates/flir-scene",
+    "crates/flir-sensor",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "LicenseRef-Proprietary"
+authors = ["cameron_griego@protonmail.com"]
+
+[workspace.dependencies]
+# Internal
+flir-env = { path = "crates/flir-env" }
+flir-scene = { path = "crates/flir-scene" }
+flir-sensor = { path = "crates/flir-sensor" }
+
+# infinity-viewports
+infinity-viewports-protocol = { git = "https://github.com/infinity-MSFS/infinity-viewports" }
+infinity-viewports-host = { git = "https://github.com/infinity-MSFS/infinity-viewports" }
+
+# External
+serde = { version = "1.0", features = ["derive"] }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

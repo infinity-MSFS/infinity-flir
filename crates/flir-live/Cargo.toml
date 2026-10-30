@@ -1,0 +1,20 @@
+[package]
+name = "flir-live"
+description = "Dev tool: live FLIR tuner. Streams the MD-10 nose viewport (colour + depth) from the injected bridge and develops the thermal image on the CPU with live sensor/environment sliders, colour and thermal side by side."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+infinity-viewports-protocol.workspace = true
+infinity-viewports-host.workspace = true
+flir-env.workspace = true
+flir-scene.workspace = true
+flir-sensor.workspace = true
+eframe = { version = "0.29.1", default-features = false, features = ["glow", "default_fonts"] }
+
+[[bin]]
+name = "flir-live"
+path = "src/main.rs"

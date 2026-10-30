@@ -1,0 +1,11 @@
+[package]
+name = "flir-env"
+description = "Environment type and derived atmospheric/solar values for the thermal model. Pure computation, no SimConnect."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+infinity-viewports-protocol.workspace = true
