@@ -1,7 +1,5 @@
 //! Fallback tiers: fail closed, automatically, and report which inputs were
-//! available. The bridge picks the highest tier its captured layers support.
-
-use infinity_viewports_protocol::Tier as WireTier;
+//! available. The develop picks the highest tier its captured layers support.
 
 /// Which captured layers are present and usable this frame.
 #[derive(Clone, Copy, Debug, Default)]
@@ -37,14 +35,6 @@ impl Tier {
             Some(Tier::ColourOnly)
         } else {
             None
-        }
-    }
-
-    pub fn to_wire(self) -> WireTier {
-        match self {
-            Tier::Full => WireTier::Full,
-            Tier::DepthOnly => WireTier::DepthOnly,
-            Tier::ColourOnly => WireTier::ColourOnly,
         }
     }
 }

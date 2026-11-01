@@ -1,6 +1,6 @@
 # Environment SimVars
 
-The Infinity Manager reads these and pushes them into `infinity_viewports_protocol::Environment
+The Infinity Manager reads these and pushes them into `flir_types::Environment
 Wire` (consumed by `flir-env`). This crate does **no** SimConnect itself; the
 list is the contract so the Manager knows exactly what to read. Names must be
 verified against the MSFS 2024 SDK SimVar reference for your SU; those marked

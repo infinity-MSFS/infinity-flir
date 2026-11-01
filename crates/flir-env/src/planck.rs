@@ -7,7 +7,7 @@
 //! *shape*: how steeply radiance rises with temperature in each band, which
 //! sets scene contrast.
 
-use infinity_viewports_protocol::Band;
+use flir_types::Band;
 
 /// Planck's law spectral radiance (W·m⁻²·sr⁻¹·µm⁻¹) at wavelength `lambda_um`
 /// and temperature `t_k` (kelvin).

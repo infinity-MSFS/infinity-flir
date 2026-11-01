@@ -6,7 +6,7 @@
 //! not a radiative-transfer solver. Every constant is documented so it can be
 //! re-tuned in `flir-live`.
 
-use infinity_viewports_protocol::Band;
+use flir_types::Band;
 
 /// ISA tropospheric lapse rate: temperature falls 6.5 °C per km of altitude.
 pub const LAPSE_RATE_C_PER_M: f32 = 0.0065;

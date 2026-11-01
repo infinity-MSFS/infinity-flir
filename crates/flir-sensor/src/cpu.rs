@@ -2,7 +2,7 @@
 //! allocation-light; correctness and clarity over speed (the real-time path is
 //! the HLSL). `flir-live` runs this on the streamed frames.
 
-use infinity_viewports_protocol::Polarity;
+use flir_types::Polarity;
 
 use crate::{Sensor, palette_rgb};
 
@@ -294,7 +294,7 @@ mod tests {
         let data: Vec<f32> = (0..w * h).map(|i| 0.4 + 0.2 * (i % w) as f32 / w as f32).collect();
         let src = ScalarFrame { w, h, data };
         let mut st = SensorState::default();
-        let mut params = infinity_viewports_protocol::SensorParams::default();
+        let mut params = flir_types::SensorParams::default();
         params.detail = 0;
         params.noise = 0;
         params.column_fpn = 0;
@@ -308,14 +308,14 @@ mod tests {
     #[test]
     fn black_hot_inverts() {
         let src = ramp(64, 4);
-        let mut params = infinity_viewports_protocol::SensorParams::default();
+        let mut params = flir_types::SensorParams::default();
         params.agc = 0;
         params.gain = 1.0;
         params.level = 0.5;
         params.detail = 0;
         params.noise = 0;
         params.column_fpn = 0;
-        params.palette_u8 = infinity_viewports_protocol::Palette::Gray as u8;
+        params.palette_u8 = flir_types::Palette::Gray as u8;
         let mut a = SensorState::default();
         let white = a.process(&src, &Sensor::new(params));
         params.polarity_u8 = Polarity::BlackHot as u8;

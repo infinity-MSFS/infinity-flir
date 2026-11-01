@@ -10,7 +10,7 @@
 use flir_env::Environment;
 use flir_env::planck::RadianceLut;
 use flir_sensor::cpu::ScalarFrame;
-use infinity_viewports_protocol::Band;
+use flir_types::Band;
 
 /// Reversed-Z near plane used to reconstruct range as `near / depth`.
 const NEAR_M: f32 = 0.05;

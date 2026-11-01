@@ -9,6 +9,7 @@ authors.workspace = true
 
 [dependencies]
 infinity-viewports-protocol.workspace = true
+flir-types.workspace = true
 infinity-viewports-host.workspace = true
 flir-env.workspace = true
 flir-scene.workspace = true

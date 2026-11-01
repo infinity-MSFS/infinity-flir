@@ -16,7 +16,7 @@ pub mod cpu;
 pub mod material;
 pub mod tier;
 
-use infinity_viewports_protocol::Band;
+use flir_types::Band;
 
 use flir_env::Environment;
 use flir_env::planck::RadianceLut;

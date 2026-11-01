@@ -24,13 +24,14 @@ use flir_env::planck::RadianceLut;
 use flir_scene::cpu::depth_to_scene;
 use flir_sensor::Sensor;
 use flir_sensor::cpu::{ScalarFrame, SensorState};
+use flir_types::{Band, EnvironmentWire, SensorParams};
 use infinity_viewports_host::camera::CameraLink;
 use infinity_viewports_host::simvars::AircraftFeed;
 use infinity_viewports_host::video::VideoReader;
 use infinity_viewports_host::{Host, HostConfig, Sim, SimTarget};
 use infinity_viewports_protocol::{
-    APPLIED_FOLLOW, APPLIED_MISSING, APPLIED_PARENTED, APPLIED_PLACED, Band, CameraControl,
-    CameraStatus, EnvironmentWire, HudGeometry, MOUNT_AIRCRAFT, MOUNT_FOLLOW, SensorParams,
+    APPLIED_FOLLOW, APPLIED_MISSING, APPLIED_PARENTED, APPLIED_PLACED, CameraControl, CameraStatus,
+    MOUNT_AIRCRAFT, MOUNT_FOLLOW,
 };
 
 /// Role tags written by the bridge's stream writer (see `infinity_viewports_gpu::stream`).
@@ -82,21 +83,9 @@ fn main() -> eframe::Result<()> {
     };
     println!("attached to pid {}", sim.pid());
 
-    // Enable FLIR so the capture tick runs, set an initial colour source, start
-    // the stream. The develop is local; the bridge only streams.
-    let flir = sim.flir();
-    let _ = flir.configure(HudGeometry {
-        eye_m: [0.0, 0.0, 0.0],
-        fov_y_deg: 24.0,
-        aspect: 1024.0 / 576.0,
-        render_size: [1024, 576],
-        beacon: infinity_viewports_protocol::BeaconSpec {
-            xy: [0, 0],
-            rgba: [0, 0, 0, 0],
-            target_size: [1024, 576],
-        },
-    });
-    let _ = flir.enable(true);
+    // Enable the bridge, set an initial colour source, start the stream. The
+    // develop is local; the bridge only streams.
+    let _ = sim.enable(true);
     let (_, fmt0, occ0) = COLOR_SOURCES[0];
     let _ = sim.set_stream_source(fmt0, occ0);
     match sim.start_stream() {

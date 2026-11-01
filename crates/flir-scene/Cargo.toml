@@ -8,7 +8,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-infinity-viewports-protocol.workspace = true
+flir-types.workspace = true
 flir-env.workspace = true
 flir-sensor.workspace = true
 serde.workspace = true

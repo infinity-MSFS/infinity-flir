@@ -19,7 +19,7 @@
 
 pub mod cpu;
 
-use infinity_viewports_protocol::{Palette, Polarity, SensorParams};
+use flir_types::{Palette, Polarity, SensorParams};
 
 /// The sensor HLSL, for the future GPU path. Embedded next to the CPU
 /// reference so the two never drift.

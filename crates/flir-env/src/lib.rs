@@ -2,7 +2,7 @@
 //! values the thermal scene model consumes.
 //!
 //! **Pure computation, no SimConnect.** The host (Infinity Manager) reads the
-//! SimVars and pushes raw values in via [`infinity_viewports_protocol::EnvironmentWire`]; this
+//! SimVars and pushes raw values in via [`flir_types::EnvironmentWire`]; this
 //! crate turns them into the quantities the scene model needs: air temperature
 //! at any altitude, humidity (measured or estimated), atmospheric extinction,
 //! and a sun direction (engine-provided when available, else NOAA).
@@ -14,7 +14,7 @@ pub mod atmos;
 pub mod planck;
 pub mod solar;
 
-use infinity_viewports_protocol::{Band, EnvironmentWire};
+use flir_types::{Band, EnvironmentWire};
 
 /// Precipitation state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
