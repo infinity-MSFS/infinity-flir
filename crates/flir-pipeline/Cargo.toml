@@ -1,0 +1,14 @@
+[package]
+name = "flir-pipeline"
+description = "Headless FLIR develop: viewports layers (depth + colour) + environment -> thermal scene -> sensor -> 8-bit gray, cropped and resampled for a display. What flir-live does per frame, without the UI."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+flir-types.workspace = true
+flir-env.workspace = true
+flir-scene.workspace = true
+flir-sensor.workspace = true

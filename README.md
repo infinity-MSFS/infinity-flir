@@ -13,6 +13,16 @@ nose viewport from [infinity-viewports](https://github.com/infinity-MSFS/infinit
 | `flir-scene`  | lib + HLSL | Thermal scene model; `cpu.rs` is the depth-driven port used live.              |
 | `flir-sensor` | lib + HLSL | Sensor model: AGC, detail, noise, FPN, halo, polarity, palette.                |
 | `flir-live`   | dev bin    | egui tuner: colour vs thermal side by side, live sensor/env/camera sliders.    |
+| `flir-pipeline` | lib      | Headless develop for a production consumer: layer decode, cloud composite, scene + sensor, crop/resample to a square display. |
+| `flir-stream` | lib (wasm) | The picture's wire: gauge state report (with environment), delta+deflate codec, chunks, reassembly. Shared by the manager and the in-sim gauge. |
+
+## Production path
+
+The Infinity Manager (`infinity-manager-v3`, `crates/flir` + `flir_handler`)
+attaches with infinity-viewports, mounts the nose camera on the airframe,
+develops each frame with `flir-pipeline` and streams it with `flir-stream` to
+the MD-10 HUD gauge (`10-systems`, `display-md-hud`), which builds against
+`flir-stream` too.
 
 ## Building
 

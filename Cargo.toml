@@ -3,8 +3,10 @@ resolver = "3"
 members = [
     "crates/flir-env",
     "crates/flir-live",
+    "crates/flir-pipeline",
     "crates/flir-scene",
     "crates/flir-sensor",
+    "crates/flir-stream",
     "crates/flir-types",
 ]
 
@@ -21,6 +23,8 @@ flir-env = { path = "crates/flir-env" }
 flir-scene = { path = "crates/flir-scene" }
 flir-sensor = { path = "crates/flir-sensor" }
 flir-types = { path = "crates/flir-types" }
+flir-pipeline = { path = "crates/flir-pipeline" }
+flir-stream = { path = "crates/flir-stream" }
 
 # infinity-viewports
 infinity-viewports-protocol = { git = "https://github.com/infinity-MSFS/infinity-viewports" }
