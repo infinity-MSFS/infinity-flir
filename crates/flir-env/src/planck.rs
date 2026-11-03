@@ -111,7 +111,11 @@ mod tests {
     #[test]
     fn normalised_at_15c() {
         let lut = RadianceLut::build(Band::Lwir);
-        assert!((lut.lookup(15.0) - 1.0).abs() < 0.02, "{}", lut.lookup(15.0));
+        assert!(
+            (lut.lookup(15.0) - 1.0).abs() < 0.02,
+            "{}",
+            lut.lookup(15.0)
+        );
     }
 
     #[test]
@@ -122,6 +126,9 @@ mod tests {
         let mwir = RadianceLut::build(Band::Mwir);
         let lwir_ratio = lwir.lookup(40.0) / lwir.lookup(10.0);
         let mwir_ratio = mwir.lookup(40.0) / mwir.lookup(10.0);
-        assert!(mwir_ratio > lwir_ratio, "mwir {mwir_ratio} lwir {lwir_ratio}");
+        assert!(
+            mwir_ratio > lwir_ratio,
+            "mwir {mwir_ratio} lwir {lwir_ratio}"
+        );
     }
 }

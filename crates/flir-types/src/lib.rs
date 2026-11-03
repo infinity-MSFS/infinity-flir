@@ -118,4 +118,3 @@ pub struct EnvironmentWire {
     pub utc_unix_s: f64,
     pub sun_dir: [f32; 3],
 }
-

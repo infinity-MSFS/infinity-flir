@@ -10,6 +10,7 @@
 use flir_env::Environment;
 use flir_env::planck::RadianceLut;
 use flir_sensor::cpu::ScalarFrame;
+use flir_sensor::par;
 use flir_types::Band;
 
 /// Reversed-Z near plane used to reconstruct range as `near / depth`.
@@ -22,7 +23,13 @@ const NEAR_M: f32 = 0.05;
 ///   modulated by a depth-derivative relief term;
 /// * atmosphere: `L = τ·L_surface + (1−τ)·B(T_path)`, `τ = exp(−k·range)`,
 ///   `range = near / depth`.
-pub fn depth_to_scene(depth: &[f32], w: usize, h: usize, env: &Environment, lut: &RadianceLut) -> ScalarFrame {
+pub fn depth_to_scene(
+    depth: &[f32],
+    w: usize,
+    h: usize,
+    env: &Environment,
+    lut: &RadianceLut,
+) -> ScalarFrame {
     let ext = env.extinction_per_m(Band::Lwir);
     let ambient = env.ambient_temp_c;
     let day = env.is_day();
@@ -37,13 +44,14 @@ pub fn depth_to_scene(depth: &[f32], w: usize, h: usize, env: &Environment, lut:
         let yi = y.clamp(0, h as isize - 1) as usize;
         depth[yi * w + xi]
     };
+    let l_path = lut.lookup(t_path);
     let mut data = vec![0f32; w * h];
-    for y in 0..h {
-        for x in 0..w {
+    par::rows(&mut data, w, |y, row| {
+        for (x, out) in row.iter_mut().enumerate() {
             let d = depth[y * w + x];
             if d <= 1e-6 {
                 let elev = 1.0 - (y as f32 / h as f32);
-                data[y * w + x] = lut.lookup(ambient - sky_depr * elev);
+                *out = lut.lookup(ambient - sky_depr * elev);
                 continue;
             }
             let range = (NEAR_M / d).max(NEAR_M);
@@ -64,9 +72,9 @@ pub fn depth_to_scene(depth: &[f32], w: usize, h: usize, env: &Environment, lut:
             let t_surf = t_ground_air + surface_warm - relief * 2.5;
             let l_surf = lut.lookup(t_surf);
             let tau = (-ext * range).exp();
-            data[y * w + x] = tau * l_surf + (1.0 - tau) * lut.lookup(t_path);
+            *out = tau * l_surf + (1.0 - tau) * l_path;
         }
-    }
+    });
     ScalarFrame { w, h, data }
 }
 
@@ -75,7 +83,14 @@ pub fn depth_to_scene(depth: &[f32], w: usize, h: usize, env: &Environment, lut:
 /// thermal-shading term (sun-facing slopes warmer, shadowed cooler); sky, range
 /// and atmosphere are identical to the depth-only path. Materials and the camera
 /// matrices are still pending, so this is "geometry-full", not material-full.
-pub fn gbuffer_to_scene(depth: &[f32], normal: Option<&[[f32; 3]]>, w: usize, h: usize, env: &Environment, lut: &RadianceLut) -> ScalarFrame {
+pub fn gbuffer_to_scene(
+    depth: &[f32],
+    normal: Option<&[[f32; 3]]>,
+    w: usize,
+    h: usize,
+    env: &Environment,
+    lut: &RadianceLut,
+) -> ScalarFrame {
     // Without this frame's camera matrices we cannot put normals or the sun into
     // a shared world frame, so we shade with a fixed light in the normal's own
     // space — this reveals true surface relief regardless of the encoding frame.

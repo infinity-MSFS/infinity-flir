@@ -1,5 +1,7 @@
 //! The stream's raw layer bytes → floats (moved from flir-live).
 
+use flir_sensor::par;
+
 /// DXGI formats the nose colour layer arrives in.
 pub const DXGI_R11G11B10_FLOAT: u32 = 26;
 pub const DXGI_R16G16B16A16_FLOAT: u32 = 10;
@@ -13,49 +15,47 @@ pub const ROLE_COLOR: u32 = 2;
 /// A little-endian R32F layer, `w × h`.
 pub fn depth_f32(w: usize, h: usize, bytes: &[u8]) -> Option<Vec<f32>> {
     let n = w * h;
-    if bytes.len() < n * 4 {
+    if bytes.len() < n * 4 || w == 0 {
         return None;
     }
-    Some(
-        bytes[..n * 4]
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
-    )
+    let mut depth = vec![0f32; n];
+    par::rows(&mut depth, w, |y, row| {
+        let src = &bytes[y * w * 4..(y + 1) * w * 4];
+        for (o, c) in row.iter_mut().zip(src.chunks_exact(4)) {
+            *o = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        }
+    });
+    Some(depth)
 }
 
 /// An HDR colour layer → linear RGB, `w × h × 3`. `None` for a format it
 /// does not know or a short buffer.
 pub fn linear_rgb(fmt: u32, w: usize, h: usize, bytes: &[u8]) -> Option<Vec<f32>> {
     let n = w * h;
+    let stride = match fmt {
+        DXGI_R11G11B10_FLOAT => 4,
+        DXGI_R16G16B16A16_FLOAT => 8,
+        _ => return None,
+    };
+    if bytes.len() < n * stride || w == 0 {
+        return None;
+    }
     let mut rgb = vec![0f32; n * 3];
-    match fmt {
-        DXGI_R11G11B10_FLOAT => {
-            if bytes.len() < n * 4 {
-                return None;
-            }
-            for i in 0..n {
-                let b = &bytes[i * 4..i * 4 + 4];
+    par::rows(&mut rgb, w * 3, |y, row| {
+        let src = &bytes[y * w * stride..(y + 1) * w * stride];
+        for (o, b) in row.chunks_exact_mut(3).zip(src.chunks_exact(stride)) {
+            if stride == 4 {
                 let u = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-                rgb[i * 3] = f11(u & 0x7ff);
-                rgb[i * 3 + 1] = f11((u >> 11) & 0x7ff);
-                rgb[i * 3 + 2] = f10(((u >> 22) & 0x3ff) as u16);
-            }
-        }
-        DXGI_R16G16B16A16_FLOAT => {
-            if bytes.len() < n * 8 {
-                return None;
-            }
-            for i in 0..n {
-                let base = i * 8;
-                for c in 0..3 {
-                    let o = base + c * 2;
-                    rgb[i * 3 + c] = half_to_f32(u16::from_le_bytes([bytes[o], bytes[o + 1]]));
+                o[0] = f11(u & 0x7ff);
+                o[1] = f11((u >> 11) & 0x7ff);
+                o[2] = f10(((u >> 22) & 0x3ff) as u16);
+            } else {
+                for (c, v) in o.iter_mut().enumerate() {
+                    *v = half_to_f32(u16::from_le_bytes([b[c * 2], b[c * 2 + 1]]));
                 }
             }
         }
-        _ => return None,
-    }
+    });
     Some(rgb)
 }
 

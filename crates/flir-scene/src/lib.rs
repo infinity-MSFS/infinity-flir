@@ -44,7 +44,12 @@ impl Default for DepthConvention {
         // confirmed per build before trusting (DepthConventionUnknown tier drop
         // otherwise). These are the documented defaults, not an assumption the
         // runtime makes silently.
-        DepthConvention { reversed_z: true, infinite_far: true, near_m: 0.05, far_m: 1_000.0 }
+        DepthConvention {
+            reversed_z: true,
+            infinite_far: true,
+            near_m: 0.05,
+            far_m: 1_000.0,
+        }
     }
 }
 
@@ -101,7 +106,15 @@ pub struct SceneConstants {
 impl SceneConstants {
     /// Build the per-frame constants from an environment, view data and tier.
     #[allow(clippy::too_many_arguments)]
-    pub fn build(env: &Environment, band: Band, inv_view_proj: [[f32; 4]; 4], cam_world: [f32; 3], depth: DepthConvention, size: [u32; 2], tier: tier::Tier) -> SceneConstants {
+    pub fn build(
+        env: &Environment,
+        band: Band,
+        inv_view_proj: [[f32; 4]; 4],
+        cam_world: [f32; 3],
+        depth: DepthConvention,
+        size: [u32; 2],
+        tier: tier::Tier,
+    ) -> SceneConstants {
         let depth_flags = (depth.reversed_z as u32) | ((depth.infinite_far as u32) << 1);
         SceneConstants {
             inv_view_proj,
@@ -145,7 +158,11 @@ pub struct SceneModel {
 
 impl SceneModel {
     pub fn new() -> SceneModel {
-        SceneModel { table: material::default_table(), lwir: RadianceLut::build(Band::Lwir), mwir: RadianceLut::build(Band::Mwir) }
+        SceneModel {
+            table: material::default_table(),
+            lwir: RadianceLut::build(Band::Lwir),
+            mwir: RadianceLut::build(Band::Mwir),
+        }
     }
 
     pub fn radiance_lut(&self, band: Band) -> &RadianceLut {

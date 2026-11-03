@@ -25,7 +25,8 @@ pub fn sat_vapour_pressure_hpa(t_c: f32) -> f32 {
 
 /// Relative humidity (%) from a dew point, both °C.
 pub fn humidity_from_dewpoint(dewpoint_c: f32, temp_c: f32) -> f32 {
-    (100.0 * sat_vapour_pressure_hpa(dewpoint_c) / sat_vapour_pressure_hpa(temp_c)).clamp(0.0, 100.0)
+    (100.0 * sat_vapour_pressure_hpa(dewpoint_c) / sat_vapour_pressure_hpa(temp_c))
+        .clamp(0.0, 100.0)
 }
 
 /// Estimate relative humidity (%) when neither humidity nor dew point is

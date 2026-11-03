@@ -85,7 +85,7 @@ fn main() -> eframe::Result<()> {
 
     // Enable the bridge, set an initial colour source, start the stream. The
     // develop is local; the bridge only streams.
-    let _ = sim.enable(true);
+    let _ = sim.flir().enable(true);
     let (_, fmt0, occ0) = COLOR_SOURCES[0];
     let _ = sim.set_stream_source(fmt0, occ0);
     match sim.start_stream() {

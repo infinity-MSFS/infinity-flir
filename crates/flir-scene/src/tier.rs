@@ -45,19 +45,37 @@ mod tests {
 
     #[test]
     fn picks_full_when_all_present() {
-        let i = Inputs { depth: true, depth_convention_known: true, gbuffer: true, clouds: true, colour: true };
+        let i = Inputs {
+            depth: true,
+            depth_convention_known: true,
+            gbuffer: true,
+            clouds: true,
+            colour: true,
+        };
         assert_eq!(Tier::select(i), Some(Tier::Full));
     }
 
     #[test]
     fn drops_to_depth_without_gbuffer() {
-        let i = Inputs { depth: true, depth_convention_known: true, gbuffer: false, clouds: true, colour: true };
+        let i = Inputs {
+            depth: true,
+            depth_convention_known: true,
+            gbuffer: false,
+            clouds: true,
+            colour: true,
+        };
         assert_eq!(Tier::select(i), Some(Tier::DepthOnly));
     }
 
     #[test]
     fn drops_to_colour_without_usable_depth() {
-        let i = Inputs { depth: true, depth_convention_known: false, gbuffer: false, clouds: false, colour: true };
+        let i = Inputs {
+            depth: true,
+            depth_convention_known: false,
+            gbuffer: false,
+            clouds: false,
+            colour: true,
+        };
         assert_eq!(Tier::select(i), Some(Tier::ColourOnly));
     }
 

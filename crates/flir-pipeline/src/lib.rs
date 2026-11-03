@@ -107,37 +107,74 @@ impl Gray {
                 _ => p[0].max(p[1]).max(p[2]),
             })
             .collect();
-        Gray { w: img.w, h: img.h, data }
+        Gray {
+            w: img.w,
+            h: img.h,
+            data,
+        }
+    }
+
+    /// A black `size × size` picture.
+    pub fn blank(size: usize) -> Gray {
+        let size = size.max(1);
+        Gray {
+            w: size,
+            h: size,
+            data: vec![0; size * size],
+        }
     }
 
     /// The centre `min(w,h)` square, area-resampled to `size × size`.
     pub fn crop_square(&self, size: usize) -> Gray {
-        let side = self.w.min(self.h);
-        let size = size.max(1);
-        if side == 0 {
-            return Gray { w: size, h: size, data: vec![0; size * size] };
-        }
-        let (x0, y0) = ((self.w - side) / 2, (self.h - side) / 2);
-        let scale = side as f32 / size as f32;
-        let mut data = Vec::with_capacity(size * size);
-        for oy in 0..size {
-            let sy0 = y0 + (oy as f32 * scale) as usize;
-            let sy1 = (y0 + ((oy + 1) as f32 * scale).ceil() as usize).min(y0 + side).max(sy0 + 1);
-            for ox in 0..size {
-                let sx0 = x0 + (ox as f32 * scale) as usize;
-                let sx1 = (x0 + ((ox + 1) as f32 * scale).ceil() as usize).min(x0 + side).max(sx0 + 1);
-                let (mut sum, mut n) = (0u32, 0u32);
-                for sy in sy0..sy1.min(self.h) {
-                    let row = sy * self.w;
-                    for sx in sx0..sx1.min(self.w) {
-                        sum += u32::from(self.data[row + sx]);
-                        n += 1;
-                    }
+        square(&self.data, self.w, self.h, 1, size, |p| p[0])
+    }
+}
+
+/// The centre `min(w,h)` square of a `w × h` image with `ch` bytes per
+/// pixel, reduced to one value per pixel by `value` and area-resampled to
+/// `size × size`. Row-parallel.
+fn square(
+    src: &[u8],
+    w: usize,
+    h: usize,
+    ch: usize,
+    size: usize,
+    value: impl Fn(&[u8]) -> u8 + Sync,
+) -> Gray {
+    let side = w.min(h);
+    let size = size.max(1);
+    if side == 0 || src.len() < w * h * ch {
+        return Gray::blank(size);
+    }
+    let (x0, y0) = ((w - side) / 2, (h - side) / 2);
+    let scale = side as f32 / size as f32;
+    let mut data = vec![0u8; size * size];
+    flir_sensor::par::rows(&mut data, size, |oy, row| {
+        let sy0 = y0 + (oy as f32 * scale) as usize;
+        let sy1 = (y0 + ((oy + 1) as f32 * scale).ceil() as usize)
+            .min(y0 + side)
+            .max(sy0 + 1);
+        for (ox, out) in row.iter_mut().enumerate() {
+            let sx0 = x0 + (ox as f32 * scale) as usize;
+            let sx1 = (x0 + ((ox + 1) as f32 * scale).ceil() as usize)
+                .min(x0 + side)
+                .max(sx0 + 1);
+            let (mut sum, mut n) = (0u32, 0u32);
+            for sy in sy0..sy1.min(h) {
+                let row = sy * w;
+                for sx in sx0..sx1.min(w) {
+                    let i = (row + sx) * ch;
+                    sum += u32::from(value(&src[i..i + ch]));
+                    n += 1;
                 }
-                data.push((sum + n / 2).checked_div(n).unwrap_or(0) as u8);
             }
+            *out = (sum + n / 2).checked_div(n).unwrap_or(0) as u8;
         }
-        Gray { w: size, h: size, data }
+    });
+    Gray {
+        w: size,
+        h: size,
+        data,
     }
 }
 
@@ -202,7 +239,9 @@ impl Pipeline {
     }
 
     /// [`develop`](Self::develop), reduced to the display's square gray
-    /// picture.
+    /// picture. Only the centre square is shown, so only it is developed:
+    /// the sides of a wide frame would cost nearly half the time at 16:9 and
+    /// skew the AGC with scenery the display never shows.
     pub fn develop_square(
         &mut self,
         depth: &[f32],
@@ -212,14 +251,41 @@ impl Pipeline {
         env: &EnvironmentWire,
         size: usize,
     ) -> Gray {
-        let img = self.develop(depth, w, h, rgb, env);
+        let rgb = rgb.filter(|c| c.len() == w * h * 3);
+        let side = w.min(h);
+        if side == 0 || depth.len() != w * h {
+            return Gray::blank(size);
+        }
+        let img = if side == w && side == h {
+            self.develop(depth, w, h, rgb, env)
+        } else {
+            let (x0, y0) = ((w - side) / 2, (h - side) / 2);
+            let depth = crop(depth, w, 1, x0, y0, side);
+            let rgb = rgb.map(|c| crop(c, w, 3, x0, y0, side));
+            self.develop(&depth, side, side, rgb.as_deref(), env)
+        };
         let palette = match self.params.palette_u8 {
             1 => Palette::Gray,
             2 => Palette::Ironbow,
             _ => Palette::PhosphorGreen,
         };
-        Gray::from_rgba(&img, palette).crop_square(size)
+        // Gray and resample in one pass over the developed picture.
+        square(&img.rgba, img.w, img.h, 4, size, |p| match palette {
+            Palette::Gray => p[0],
+            _ => p[0].max(p[1]).max(p[2]),
+        })
     }
+}
+
+/// The `side × side` square at `(x0, y0)` of a row-major image `w` pixels
+/// wide with `ch` values per pixel.
+fn crop(src: &[f32], w: usize, ch: usize, x0: usize, y0: usize, side: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(side * side * ch);
+    for y in y0..y0 + side {
+        let row = (y * w + x0) * ch;
+        out.extend_from_slice(&src[row..row + side * ch]);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -245,7 +311,9 @@ mod tests {
     fn a_sky_and_ground_frame_develops_to_the_requested_square() {
         let (w, h) = (64, 36);
         // Top half sky (0), bottom half ground at ~500 m (0.05 / 500).
-        let depth: Vec<f32> = (0..w * h).map(|i| if i / w < h / 2 { 0.0 } else { 1e-4 }).collect();
+        let depth: Vec<f32> = (0..w * h)
+            .map(|i| if i / w < h / 2 { 0.0 } else { 1e-4 })
+            .collect();
         let mut p = Pipeline::default();
         let g = p.develop_square(&depth, w, h, None, &default_env(), 32);
         assert_eq!((g.w, g.h, g.data.len()), (32, 32, 32 * 32));

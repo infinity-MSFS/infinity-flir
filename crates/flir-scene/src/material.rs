@@ -50,8 +50,22 @@ pub struct MaterialThermal {
 }
 
 impl MaterialThermal {
-    pub const fn new(emissivity: f32, base_offset_c: f32, sun_loading_c: f32, inertia: f32, wetting: f32, fresnel: f32) -> Self {
-        Self { emissivity, base_offset_c, sun_loading_c, inertia, wetting, fresnel }
+    pub const fn new(
+        emissivity: f32,
+        base_offset_c: f32,
+        sun_loading_c: f32,
+        inertia: f32,
+        wetting: f32,
+        fresnel: f32,
+    ) -> Self {
+        Self {
+            emissivity,
+            base_offset_c,
+            sun_loading_c,
+            inertia,
+            wetting,
+            fresnel,
+        }
     }
 }
 
@@ -125,7 +139,13 @@ mod tests {
     #[test]
     fn asphalt_retains_more_than_vegetation() {
         let t = default_table();
-        assert!(t[MaterialClass::Asphalt as usize].inertia > t[MaterialClass::Vegetation as usize].inertia);
-        assert!(t[MaterialClass::Asphalt as usize].sun_loading_c > t[MaterialClass::Vegetation as usize].sun_loading_c);
+        assert!(
+            t[MaterialClass::Asphalt as usize].inertia
+                > t[MaterialClass::Vegetation as usize].inertia
+        );
+        assert!(
+            t[MaterialClass::Asphalt as usize].sun_loading_c
+                > t[MaterialClass::Vegetation as usize].sun_loading_c
+        );
     }
 }

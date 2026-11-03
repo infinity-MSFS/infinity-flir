@@ -18,6 +18,7 @@
 //! validated against the reference on the same frame.
 
 pub mod cpu;
+pub mod par;
 
 use flir_types::{Palette, Polarity, SensorParams};
 
@@ -36,7 +37,11 @@ impl Sensor {
         Sensor { params }
     }
     pub fn polarity(&self) -> Polarity {
-        if self.params.polarity_u8 == 1 { Polarity::BlackHot } else { Polarity::WhiteHot }
+        if self.params.polarity_u8 == 1 {
+            Polarity::BlackHot
+        } else {
+            Polarity::WhiteHot
+        }
     }
     pub fn palette(&self) -> Palette {
         match self.params.palette_u8 {
@@ -73,7 +78,11 @@ fn ironbow(v: f32) -> [f32; 3] {
         let (b, cb) = pair[1];
         if v <= b {
             let t = ((v - a) / (b - a)).clamp(0.0, 1.0);
-            return [ca[0] + (cb[0] - ca[0]) * t, ca[1] + (cb[1] - ca[1]) * t, ca[2] + (cb[2] - ca[2]) * t];
+            return [
+                ca[0] + (cb[0] - ca[0]) * t,
+                ca[1] + (cb[1] - ca[1]) * t,
+                ca[2] + (cb[2] - ca[2]) * t,
+            ];
         }
     }
     STOPS[5].1

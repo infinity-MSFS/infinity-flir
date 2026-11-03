@@ -57,7 +57,8 @@ pub fn solar_position(unix_s: f64, lat_deg: f64, lon_deg: f64) -> SolarPosition 
     let true_long = geom_mean_long + sun_eq_ctr;
     let app_long = true_long - 0.00569 - 0.00478 * libm_sin((125.04 - 1934.136 * t) * DEG);
 
-    let mean_obliq = 23.0 + (26.0 + (21.448 - t * (46.815 + t * (0.00059 - t * 0.001813))) / 60.0) / 60.0;
+    let mean_obliq =
+        23.0 + (26.0 + (21.448 - t * (46.815 + t * (0.00059 - t * 0.001813))) / 60.0) / 60.0;
     let obliq_corr = mean_obliq + 0.00256 * libm_cos((125.04 - 1934.136 * t) * DEG);
 
     let decl = libm_asin(libm_sin(obliq_corr * DEG) * libm_sin(app_long * DEG)) / DEG;
@@ -66,9 +67,9 @@ pub fn solar_position(unix_s: f64, lat_deg: f64, lon_deg: f64) -> SolarPosition 
     let y = libm_tan(obliq_corr / 2.0 * DEG);
     let y = y * y;
     let l0 = geom_mean_long * DEG;
-    let eot = 4.0
-        / DEG
-        * (y * libm_sin(2.0 * l0) - 2.0 * eccent * libm_sin(m) + 4.0 * eccent * y * libm_sin(m) * libm_cos(2.0 * l0)
+    let eot = 4.0 / DEG
+        * (y * libm_sin(2.0 * l0) - 2.0 * eccent * libm_sin(m)
+            + 4.0 * eccent * y * libm_sin(m) * libm_cos(2.0 * l0)
             - 0.5 * y * y * libm_sin(4.0 * l0)
             - 1.25 * eccent * eccent * libm_sin(2.0 * m));
 
@@ -77,12 +78,17 @@ pub fn solar_position(unix_s: f64, lat_deg: f64, lon_deg: f64) -> SolarPosition 
     let minutes_utc = day_frac * 1440.0;
     let true_solar_time = (minutes_utc + eot + 4.0 * lon_deg).rem_euclid(1440.0);
 
-    let hour_angle = if true_solar_time / 4.0 < 0.0 { true_solar_time / 4.0 + 180.0 } else { true_solar_time / 4.0 - 180.0 };
+    let hour_angle = if true_solar_time / 4.0 < 0.0 {
+        true_solar_time / 4.0 + 180.0
+    } else {
+        true_solar_time / 4.0 - 180.0
+    };
 
     let lat = lat_deg * DEG;
     let decl_r = decl * DEG;
     let ha = hour_angle * DEG;
-    let cos_zenith = libm_sin(lat) * libm_sin(decl_r) + libm_cos(lat) * libm_cos(decl_r) * libm_cos(ha);
+    let cos_zenith =
+        libm_sin(lat) * libm_sin(decl_r) + libm_cos(lat) * libm_cos(decl_r) * libm_cos(ha);
     let cos_zenith = cos_zenith.clamp(-1.0, 1.0);
     let zenith = libm_acos(cos_zenith);
     let elevation = 90.0 - zenith / DEG;
@@ -105,7 +111,10 @@ pub fn solar_position(unix_s: f64, lat_deg: f64, lon_deg: f64) -> SolarPosition 
 
     // Atmospheric-refraction correction to elevation (NOAA approximation).
     let refr = refraction_deg(elevation);
-    SolarPosition { elevation_deg: elevation + refr, azimuth_deg: azimuth }
+    SolarPosition {
+        elevation_deg: elevation + refr,
+        azimuth_deg: azimuth,
+    }
 }
 
 fn refraction_deg(elev: f64) -> f64 {
@@ -161,7 +170,11 @@ mod tests {
         // 2024-06-21T12:00:00Z
         let unix = 1_718_971_200.0;
         let p = solar_position(unix, 51.4769, 0.0);
-        assert!(p.elevation_deg > 55.0 && p.elevation_deg < 63.0, "elev {}", p.elevation_deg);
+        assert!(
+            p.elevation_deg > 55.0 && p.elevation_deg < 63.0,
+            "elev {}",
+            p.elevation_deg
+        );
         assert!((p.azimuth_deg - 180.0).abs() < 25.0, "az {}", p.azimuth_deg);
         let d = p.direction_enu();
         assert!(d[1] > 0.0, "sun should be above horizon");

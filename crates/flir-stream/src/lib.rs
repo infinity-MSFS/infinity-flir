@@ -12,7 +12,12 @@
 //!
 //! * The manager develops only while state reports keep arriving with
 //!   `active: true`; a HUD that is stowed, killed or unloaded stops the
-//!   pipeline by going quiet. Nothing has to say goodbye.
+//!   pipeline by going quiet.
+//! * A gauge being killed (the flight ending or restarting) also sends
+//!   [`GOODBYE_EVENT`], best effort, so the manager can take its DLLs out of
+//!   the sim at once instead of waiting out the silence. Each gauge names
+//!   itself ([`StateReport::source`]) so one of two HUDs leaving does not
+//!   end the other's picture.
 //! * A frame is 8-bit gray, square, `size × size`, encoded ([`Codec`]) and
 //!   cut into base64 pieces small enough for the CommBus hop
 //!   ([`CHUNK_CHARS`]). Every piece carries the frame header, so any piece
@@ -29,6 +34,9 @@ use serde::{Deserialize, Serialize};
 
 /// Gauge → manager, fire-and-forget: a [`StateReport`].
 pub const STATE_EVENT: &str = "flir.state";
+/// Gauge → manager, fire-and-forget, sent once as the gauge is killed: a
+/// [`Goodbye`].
+pub const GOODBYE_EVENT: &str = "flir.goodbye";
 /// Manager → gauge, acked: one [`Chunk`].
 pub const CHUNK_COMMAND: &str = "flir.chunk";
 
@@ -65,6 +73,18 @@ pub struct StateReport {
     /// fields fall back to the model's own estimates.
     #[serde(default)]
     pub env: EnvReport,
+    /// Which gauge is reporting (e.g. `capt` / `fo`), unique among the
+    /// gauges asking at once. Empty from a gauge that predates it.
+    #[serde(default)]
+    pub source: String,
+}
+
+/// A gauge leaving: it will send no more reports.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Goodbye {
+    /// The [`StateReport::source`] it reported under.
+    #[serde(default)]
+    pub source: String,
 }
 
 /// The environment as the aircraft reads it — `flir_types::EnvironmentWire`'s
@@ -405,16 +425,26 @@ mod tests {
         let data: Vec<u8> = (0..128u32 * 128)
             .map(|i| {
                 seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-                let smooth = 100.0 + 60.0 * ((i % 128) as f32 / 20.0).sin() + (i / 128) as f32 * 0.4;
+                let smooth =
+                    100.0 + 60.0 * ((i % 128) as f32 / 20.0).sin() + (i / 128) as f32 * 0.4;
                 (smooth + (seed >> 28) as f32) as u8
             })
             .collect();
-        let f = Frame { seq: 1, width: 128, height: 128, data };
+        let f = Frame {
+            seq: 1,
+            width: 128,
+            height: 128,
+            data,
+        };
         let lossless = encode(&f.data, 128, Codec::Gray8Delta, 1, 4);
         let lossy = encode(&f.data, 128, Codec::Gray8Delta, 4, 4);
         assert!(lossy.len() <= lossless.len());
         let back = decode(&lossy, 128, 128, Codec::Gray8Delta).unwrap();
-        assert!(back.iter().zip(&f.data).all(|(a, b)| (i16::from(*a) - i16::from(*b)).abs() <= 2));
+        assert!(
+            back.iter()
+                .zip(&f.data)
+                .all(|(a, b)| (i16::from(*a) - i16::from(*b)).abs() <= 2)
+        );
     }
 
     #[test]
@@ -433,19 +463,49 @@ mod tests {
     fn a_restarted_sender_is_accepted() {
         let mut r = Reassembler::new();
         let big = frame(1_000_000, 32);
-        assert!(matches!(deliver(&mut r, chunks(&big, Codec::Gray8, 1, 4096)), Some(Ok(_))));
+        assert!(matches!(
+            deliver(&mut r, chunks(&big, Codec::Gray8, 1, 4096)),
+            Some(Ok(_))
+        ));
         let small = frame(5, 32);
-        assert_eq!(deliver(&mut r, chunks(&small, Codec::Gray8, 1, 4096)), Some(Ok(small)));
+        assert_eq!(
+            deliver(&mut r, chunks(&small, Codec::Gray8, 1, 4096)),
+            Some(Ok(small))
+        );
     }
 
     #[test]
     fn garbage_is_refused_without_allocating() {
         let mut r = Reassembler::new();
-        let bad = Chunk { seq: 1, idx: 0, total: 1_000_000, w: 8, h: 8, codec: Codec::Gray8, data: String::new() };
+        let bad = Chunk {
+            seq: 1,
+            idx: 0,
+            total: 1_000_000,
+            w: 8,
+            h: 8,
+            codec: Codec::Gray8,
+            data: String::new(),
+        };
         assert!(matches!(r.push(bad), Some(Err(_))));
-        let huge = Chunk { seq: 1, idx: 0, total: 1, w: 50_000, h: 50_000, codec: Codec::Gray8, data: String::new() };
+        let huge = Chunk {
+            seq: 1,
+            idx: 0,
+            total: 1,
+            w: 50_000,
+            h: 50_000,
+            codec: Codec::Gray8,
+            data: String::new(),
+        };
         assert!(matches!(r.push(huge), Some(Err(_))));
-        let short = Chunk { seq: 2, idx: 0, total: 1, w: 8, h: 8, codec: Codec::Gray8, data: "AAAA".into() };
+        let short = Chunk {
+            seq: 2,
+            idx: 0,
+            total: 1,
+            w: 8,
+            h: 8,
+            codec: Codec::Gray8,
+            data: "AAAA".into(),
+        };
         assert!(matches!(r.push(short), Some(Err(_))));
     }
 

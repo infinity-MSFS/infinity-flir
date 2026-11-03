@@ -75,21 +75,28 @@ impl Environment {
         let (humidity_pct, humidity_estimated) = if w.humidity_pct.is_finite() {
             (w.humidity_pct.clamp(0.0, 100.0), false)
         } else if w.dewpoint_c.is_finite() && w.ambient_temp_c.is_finite() {
-            (atmos::humidity_from_dewpoint(w.dewpoint_c, w.ambient_temp_c), false)
+            (
+                atmos::humidity_from_dewpoint(w.dewpoint_c, w.ambient_temp_c),
+                false,
+            )
         } else {
-            (atmos::humidity_from_visibility(w.visibility_m, w.precip_rate), true)
+            (
+                atmos::humidity_from_visibility(w.visibility_m, w.precip_rate),
+                true,
+            )
         };
 
         let water_loading = atmos::water_loading(humidity_pct, w.precip_rate, in_cloud);
 
         // Sun: engine value if finite, else NOAA.
-        let (sun_dir_enu, sun_elevation_deg, sun_from_engine) = if w.sun_dir.iter().all(|c| c.is_finite()) && w.sun_dir.iter().any(|&c| c != 0.0) {
-            let d = normalise(w.sun_dir);
-            (d, d[1].clamp(-1.0, 1.0).asin().to_degrees(), true)
-        } else {
-            let p = solar::solar_position(w.utc_unix_s, w.lat_deg, w.lon_deg);
-            (p.direction_enu(), p.elevation_deg as f32, false)
-        };
+        let (sun_dir_enu, sun_elevation_deg, sun_from_engine) =
+            if w.sun_dir.iter().all(|c| c.is_finite()) && w.sun_dir.iter().any(|&c| c != 0.0) {
+                let d = normalise(w.sun_dir);
+                (d, d[1].clamp(-1.0, 1.0).asin().to_degrees(), true)
+            } else {
+                let p = solar::solar_position(w.utc_unix_s, w.lat_deg, w.lon_deg);
+                (p.direction_enu(), p.elevation_deg as f32, false)
+            };
 
         Environment {
             ambient_temp_c: w.ambient_temp_c,
@@ -137,7 +144,11 @@ impl Environment {
 
 fn normalise(v: [f32; 3]) -> [f32; 3] {
     let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-    if n > 1e-6 { [v[0] / n, v[1] / n, v[2] / n] } else { [0.0, 1.0, 0.0] }
+    if n > 1e-6 {
+        [v[0] / n, v[1] / n, v[2] / n]
+    } else {
+        [0.0, 1.0, 0.0]
+    }
 }
 
 #[cfg(test)]

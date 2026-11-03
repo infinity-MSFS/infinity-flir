@@ -11,6 +11,7 @@
 use flir_env::Environment;
 use flir_env::planck::RadianceLut;
 use flir_sensor::cpu::ScalarFrame;
+use flir_sensor::par;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CloudParams {
@@ -57,22 +58,30 @@ pub fn composite(
         .collect();
     let refl = percentile(&mut samp, 0.98).max(1e-4);
     let l_cloud = lut.lookup(env.air_temp_at(p.alt_m));
-    for i in 0..n {
-        let (r, g, b) = (rgb[i * 3], rgb[i * 3 + 1], rgb[i * 3 + 2]);
-        if !(r.is_finite() && g.is_finite() && b.is_finite()) {
-            continue;
+    let w = scene.w;
+    par::rows(&mut scene.data[..n], w, |y, row| {
+        for (x, out) in row.iter_mut().enumerate() {
+            let i = (y * w + x) * 3;
+            let (r, g, b) = (rgb[i], rgb[i + 1], rgb[i + 2]);
+            if !(r.is_finite() && g.is_finite() && b.is_finite()) {
+                continue;
+            }
+            let maxc = r.max(g).max(b);
+            let minc = r.min(g).min(b);
+            let sat = if maxc > 1e-4 {
+                (maxc - minc) / maxc
+            } else {
+                0.0
+            };
+            let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            let bright = smoothstep(p.thresh, p.thresh + 0.35, lum / refl);
+            let white = 1.0 - smoothstep(p.sat, p.sat + 0.2, sat);
+            let op = (bright * white * p.gain).clamp(0.0, 1.0);
+            if op > 0.0 {
+                *out = op * l_cloud + (1.0 - op) * *out;
+            }
         }
-        let maxc = r.max(g).max(b);
-        let minc = r.min(g).min(b);
-        let sat = if maxc > 1e-4 { (maxc - minc) / maxc } else { 0.0 };
-        let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-        let bright = smoothstep(p.thresh, p.thresh + 0.35, lum / refl);
-        let white = 1.0 - smoothstep(p.sat, p.sat + 0.2, sat);
-        let op = (bright * white * p.gain).clamp(0.0, 1.0);
-        if op > 0.0 {
-            scene.data[i] = op * l_cloud + (1.0 - op) * scene.data[i];
-        }
-    }
+    });
 }
 
 /// Smoothstep (Hermite) between `e0` and `e1`.
@@ -81,12 +90,14 @@ pub fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// `p`-quantile of `v` (sorts in place). `p` in [0,1].
+/// `p`-quantile of `v` (reorders it). `p` in [0,1].
 pub fn percentile(v: &mut [f32], p: f32) -> f32 {
     if v.is_empty() {
         return 0.0;
     }
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let idx = ((v.len() as f32 - 1.0) * p.clamp(0.0, 1.0)).round() as usize;
-    v[idx.min(v.len() - 1)]
+    let (_, nth, _) = v.select_nth_unstable_by(idx.min(v.len() - 1), |a, b| {
+        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    *nth
 }
